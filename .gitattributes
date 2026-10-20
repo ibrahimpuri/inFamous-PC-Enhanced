@@ -1,7 +1,6 @@
 * text=auto
-*.bat text eol=crlf
-*.cmd text eol=crlf
-*.ps1 text eol=crlf
+# No eol=crlf here: GitHub's download zips apply it, so .cmd / .bat / .ps1 files would arrive with CRLF and fail
+# the updater's blob-hash check ("arrived damaged"). The updater writes those scripts with CRLF itself.
 # Applied to the generated files byte for byte: keep them exactly as written
 installer/patches/** -text
 installer/generated.lock -text

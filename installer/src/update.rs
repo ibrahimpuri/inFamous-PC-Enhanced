@@ -678,9 +678,13 @@ pub fn plan(root: &Path, m: &Manifest, r: &Remote) -> Result<Plan> {
 // Apply
 // ---------------------------------------------------------------------------------------------
 
+/// A download holds the blob, byte for byte or as a CRLF copy: GitHub's zips apply the repository's
+/// `eol=crlf` attributes, so a script can arrive with CRLF although the blob has LF.
 fn check_blob(p: &Path, e: &Entry) -> Result<()> {
+    if local_matches(p, &e.sha) {
+        return Ok(());
+    }
     match git_blob_sha(p) {
-        Some(h) if h == e.sha => Ok(()),
         Some(_) => bail!(
             "{} arrived damaged or changed on GitHub during the update; run the update again",
             e.path
@@ -886,6 +890,23 @@ mod tests {
     }
 
     #[test]
+    fn zip_script_with_crlf_passes() {
+        // GitHub's zip of a repository with `*.cmd text eol=crlf` holds the LF blob as CRLF.
+        let d = std::env::temp_dir().join("ifupd_zip_crlf_test.cmd");
+        fs::write(&d, b"hello\r\n").unwrap();
+        let e = Entry {
+            path: "build.cmd".into(),
+            repo_path: "build.cmd".into(),
+            sha: "ce013625030ba8dba906f756967f9e9ca394464a".into(), // blob of "hello\n"
+            size: 6,
+        };
+        assert!(check_blob(&d, &e).is_ok());
+        fs::write(&d, b"hellO\r\n").unwrap();
+        assert!(check_blob(&d, &e).is_err());
+        let _ = fs::remove_file(&d);
+    }
+
+    #[test]
     fn line_ends() {
         let d = std::env::temp_dir().join("ifupd_eol_test.txt");
         fs::write(&d, b"hello\r\n").unwrap();
@@ -926,7 +947,7 @@ mod manifest_tests {
             "/infamous.toml"
         )))
         .unwrap();
-        assert_eq!(m.update_repo.as_deref(), Some("whompay/inFAMOUSreborn"));
+        assert_eq!(m.update_repo.as_deref(), Some("ibrahimpuri/inFamous-PC-Enhanced"));
         assert_eq!(m.update_branch, "main");
         assert_eq!(m.update_path, "");
     }
