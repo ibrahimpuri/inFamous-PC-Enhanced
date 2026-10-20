@@ -628,3 +628,6 @@ extern "C" int infamous_anim_lod_skip(ppu_context* ctx)
 
 /* v233: car pop-in probe + CAR_DIST_SCALE / CAR_TRAFFIC_RADIUS knobs (inert unless set; see car_v233.h) */
 #include "car_v233.h"
+
+/* Gameplay cheats for the launcher's mods: CHEAT_XP / CHEAT_KARMA / CHEAT_ALL_POWERS (inert unless set; see the header) */
+#include "infamous_cheats.h"

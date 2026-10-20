@@ -25,6 +25,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include "rsx_getenv_cache.h"   /* cached getenv() for hot paths (2026-10-04) */
+#ifdef PS3RECOMP_DLSS
+#include "rsx_dlss.h"           /* optional NVIDIA DLAA (DLSS=1), rsx_dlss.cpp */
+#endif
 #include "ps3emu/hz_stats.h"      /* v225A hitch attribution counters */
 #if defined(__SSE4_1__)
 #include <smmintrin.h>   /* v30d: vertex fetch shuffles */
@@ -832,6 +835,9 @@ static int samp_table_get(const u32* keys)
                 UINT na = amap[(k >> 16) & 7u];
                 if (fa == 0) na = 1; else if (fa > 0 && (UINT)fa > na) na = (UINT)fa;
                 if (lb && mip) sd.MipLODBias = (float)(int)(signed char)(u8)((k >> 19) & 0xFFu) / 16.0f;
+#ifdef PS3RECOMP_DLSS
+                if (mip) sd.MipLODBias += rsx_dlss_mip_bias();   /* DLAA: NVIDIA's negative texture LOD bias */
+#endif
                 if (na > 1 && mag && mn && mip == 2) {
                     sd.Filter = D3D12_FILTER_ANISOTROPIC;
                     sd.MaxAnisotropy = na;
@@ -1484,6 +1490,10 @@ static int init_d3d12(u32 width, u32 height)
         factory->lpVtbl->Release(factory);
         return -1;
     }
+
+#ifdef PS3RECOMP_DLSS
+    rsx_dlss_device_init(s_d3d.device, BBW, BBH);   /* DLSS=1: start NGX (no-op otherwise) */
+#endif
 
     /* Create swap chain */
     DXGI_SWAP_CHAIN_DESC1 sc_desc = {0};
@@ -7291,6 +7301,14 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                 s_fl_hit = s_fl_wr = 0; }
         }
     }
+#ifdef PS3RECOMP_DLSS
+    /* DLAA: does this draw rasterize the main scene (full-size target + depth, depth test on)? Such draws get the
+     * frame's sub-pixel jitter in the epilogue below, so it is part of the VCB_DEDUP identity. */
+    const int dlss_q = dr ? rsx_dlss_draw_qualifies(st->depth_test_enable, dr->zeta_off, dr->zw, dr->zh, dr->rt_off,
+                                                    dr->rt_w, dr->rt_h, dr->vp_w, dr->vp_h, s_d3d.width, s_d3d.height) : 0;
+#else
+    const int dlss_q = 0;
+#endif
     {   /* v219g VCB_DEDUP (default 1; 0 = off; ABX 0x8000000 = off for in-run A/B): skip writing this draw's VP
          * constant slot when it would be byte-identical to the last slot written in this batch -- same VS entry (same
          * used-constant mask), no constant written since (rsx_state.vertex_constants_dirty, set by every
@@ -7302,6 +7320,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         static int dd = -1;
         static u32 s_vcb_slot = 0, s_vcb_frame = 0xFFFFFFFFu; static int s_vcb_par = -1, s_vcb_vs = -9;
         static const void* s_vcb_ve = NULL; static u32 s_vcb_hash = 0; static float s_vcb_z[4]; static u64 s_vcb_hit = 0, s_vcb_full = 0; static u32 s_vcb_rep = 0;
+        static int s_vcb_dq = -1;   /* DLAA jitter flag of the last full slot */
         if (s_vcb_cmp < 0) { const char* c = getenv("VCB_CMP"); s_vcb_cmp = (c && *c == '1') ? 1 : 0; }
         if (dd < 0) { const char* e = getenv("VCB_DEDUP"); dd = (e && *e == '0') ? 0 : 1;
             if (getenv("VP_MVP") || getenv("RSX_DBG_CB") || getenv("DBG_ZOOM") || getenv("VPC_DUMP_FP") || getenv("VPC_DUMP_VS") ||
@@ -7314,7 +7333,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         extern volatile int g_abx;
         if (dd && dr && !(g_abx & 0x8000000) && ve0 && s_vcb_ve == (const void*)ve0 && s_vcb_hash == ve0->hash && s_vcb_vs == vs_idx &&
             slot > s_vcb_slot && s_vcb_frame == s_frame_no && s_vcb_par == s_d3d.vp_parity &&
-            !memcmp(zin, s_vcb_z, sizeof zin) &&
+            !memcmp(zin, s_vcb_z, sizeof zin) && s_vcb_dq == dlss_q &&
             (!cchg || (s_vcb_cmp > 0 && s_vcb_sh_ok && ve0->cvalid && !ve0->crel && !(g_abx & 0x40000000) && vcb_runs_equal(ve0, st)))) {   /* v219m: equal re-sent constants (VCB_CMP=1) */
             ((D3D12DrawRecord*)dr)->vcb_slot = s_vcb_slot;
             s_vcb_hit++;
@@ -7327,6 +7346,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         s_vcb_full++;
         s_vcb_slot = slot; s_vcb_frame = s_frame_no; s_vcb_par = s_d3d.vp_parity; s_vcb_vs = vs_idx; s_vcb_ve = ve0; s_vcb_hash = ve0 ? ve0->hash : 0;
         memcpy(s_vcb_z, zin, sizeof zin);
+        s_vcb_dq = dlss_q;
     }
     char* dst = (char*)s_d3d.vp_cb_mapped
         + ((u64)s_d3d.vp_parity * s_max_draws + slot) * VP_CB_STRIDE;
@@ -7449,6 +7469,26 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                if (lock < 0) { const char* le = getenv("DBG_LOCK"); lock = le ? atoi(le) : 0; }
                if (lock && s_lock_valid) { ux = s_lock_x; uy = s_lock_y; }
                vpx[0] = k; vpx[1] = k; vpx[4] = -ux * k; vpx[5] = -uy * k; } }
+
+#ifdef PS3RECOMP_DLSS
+    if (dr) {   /* DLAA: camera tracking / probe see the unjittered epilogue, then the scene draws get the jitter */
+        const VPVSEntry* dve = (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) ? &s_d3d.vp_vs[vs_idx] : NULL;
+        rsx_dlss_draw_info di;
+        di.frame = s_frame_no; di.rec_index = slot; di.vs_idx = vs_idx; di.vs_hash = dve ? dve->hash : 0;
+        di.vs_src = dve ? dve->src : NULL; di.cuse = (dve && dve->cvalid && !dve->crel) ? dve->cuse : NULL;
+        di.consts = (const float*)st->vertex_constants;
+        di.rt_off = dr->rt_off; di.rt_w = dr->rt_w; di.rt_h = dr->rt_h; di.zeta_off = dr->zeta_off; di.zw = dr->zw; di.zh = dr->zh;
+        di.vp_x = dr->vp_x; di.vp_y = dr->vp_y; di.vp_w = dr->vp_w; di.vp_h = dr->vp_h;
+        di.fp_addr = dr->fp_addr; di.vcount = dr->vertex_count; di.color_target = st->color_target;
+        di.mrt = (dr->rt_mrt[0] ? 1u : 0u) + (dr->rt_mrt[1] ? 1u : 0u) + (dr->rt_mrt[2] ? 1u : 0u);
+        di.depth_test = st->depth_test_enable; di.depth_mask = st->depth_mask; di.blend = dr->blend;
+        di.posscale[0] = vpx[0]; di.posscale[1] = vpx[1]; di.posscale[2] = vpx[2];
+        di.posoffset[0] = vpx[4]; di.posoffset[1] = vpx[5]; di.posoffset[2] = vpx[6];
+        di.guest_w = s_d3d.width; di.guest_h = s_d3d.height;
+        rsx_dlss_note_draw(&di, dlss_q);
+        if (dlss_q) rsx_dlss_jitter_ndc(&vpx[4], &vpx[5]);
+    }
+#endif
 
     /* VPC_DUMP_FP=<hex fp>: for the first 3 draws using that fragment program,
      * print the vertex constants a world*viewproj VP reads (c256..c269, c464..c467),
@@ -10081,6 +10121,10 @@ static void render_frame_exec(void)
             double _rec0 = perf_on() ? perf_now() : 0.0;
             int seen_small_vp = 0, captured = 0;
             gq_mark(GQ_VPBEGIN);   /* v199 */
+#ifdef PS3RECOMP_DLSS
+            const u32 dlss_last_scene = rsx_dlss_exec_last_scene_draw();   /* DLAA: copy the scene depth after this draw */
+            const u32 dlss_composite = rsx_dlss_exec_composite_draw();     /* ... and the HUD-less image after this one */
+#endif
             for (u32 d = 0; d < s_rf_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_rf_draws[d];
                 if (!dr->is_vp) continue;
@@ -10510,6 +10554,23 @@ static void render_frame_exec(void)
                             s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list, dr->vertex_count, 1, 0, 0);
                     }
                 }
+#ifdef PS3RECOMP_DLSS
+                if (d == dlss_last_scene && cur_zs >= 0 && s_zs[cur_zs].res) {   /* scene complete: its depth for DLAA */
+                    u32 zst = (u32)s_zs[cur_zs].st;
+                    rsx_dlss_capture_depth(s_d3d.cmd_list, s_zs[cur_zs].res, &zst);
+                    s_zs[cur_zs].st = (D3D12_RESOURCE_STATES)zst;
+                }
+                if (d == dlss_composite) {   /* post-processed scene on the display buffer, HUD not drawn yet */
+                    if (cur_rt >= 0 && cur_rt < MAX_OFF_RTS && s_d3d.off_rt[cur_rt].res) {
+                        u32 rst = (u32)s_d3d.off_rt[cur_rt].st;
+                        rsx_dlss_capture_color(s_d3d.cmd_list, s_d3d.off_rt[cur_rt].res, &rst);
+                        s_d3d.off_rt[cur_rt].st = (D3D12_RESOURCE_STATES)rst;
+                    } else if (cur_rt == -1) {
+                        u32 rst = (u32)D3D12_RESOURCE_STATE_RENDER_TARGET;
+                        rsx_dlss_capture_color(s_d3d.cmd_list, s_d3d.render_targets[fi], &rst);
+                    }
+                }
+#endif
                 /* Conversion stores depth only, not stencil. Read-only particles
                  * must not force a full-screen conversion before the next particle. */
                 if (cur_zs >= 0 && (!(dr->cull & 0x8000u) || (dr->cull & 0x300u) == 0x300u))
@@ -10821,6 +10882,13 @@ static void render_frame_exec(void)
 skip_dump_consider: ;
     guest_fb_present(fi);
     composite_present(fi);
+#ifdef PS3RECOMP_DLSS
+    if (s_rf_present && rsx_dlss_active()) {   /* DLAA over the finished game image, before the port's overlay */
+        const int dz = zs_find_off(rsx_dlss_exec_zeta(), s_d3d.width, s_d3d.height);
+        rsx_dlss_frame_end(s_d3d.cmd_list, s_d3d.render_targets[fi], BBW, BBH,
+                           dz >= 0 ? s_zs[dz].res : NULL, dz >= 0 ? (u32)s_zs[dz].st : 0u);
+    }
+#endif
     /* In-game system dialogs (cellMsgDialog) drawn over the finished frame -- rsx_ui_overlay.c. */
     { extern void uiov_render(ID3D12Device*, ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
                               unsigned, unsigned, DXGI_FORMAT, HWND);
@@ -11362,6 +11430,9 @@ static void render_frame(void)
     s_rf_draws = s_d3d.draws; s_rf_count = s_d3d.draw_count;
     s_rf_parity = s_d3d.vp_parity; s_rf_frame_no = s_frame_no;
     s_rf_present = s_present_this_frame;
+#ifdef PS3RECOMP_DLSS
+    rsx_dlss_handoff(s_present_this_frame);   /* this batch's jitter/camera -> the render thread; next frame's jitter */
+#endif
     if (s_present_this_frame) { s_split_recs = 0; s_split_disp = 0; s_fs_pres_tick = GetTickCount64(); }   /* v103A */
     { extern volatile u32 g_gcm_last_flip_off; extern volatile u32 g_gcm_fifo_flip_off;
       /* v62: the flip the FIFO has executed up to (marker), not the PPU's latest request */

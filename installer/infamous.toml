@@ -284,6 +284,9 @@ exclude = [
   "Play inFamous.cmd",
   # the installer's own build output, logs and per-install files
   "installer/target/", "installer/*.log", "installer/launch.txt", "dist/",
+  # the launcher's per-player and third-party files (settings, OptiScaler + NVIDIA's DLSS 5 model, DLSS SDK, backups)
+  "launcher/launcher.ini", "launcher/dlss5/", "launcher/dlss/backup/", "launcher/dlss/original/",
+  "launcher/dlss/removed-upstream/", "dlss-sdk/", "save-backups/", "github-enhanced/",
 ]
 keep = [
   "installer/pgo/infamous.profdata",
@@ -296,7 +299,8 @@ keep = [
 # `infamous-installer update` and the setup's "Update now": where new versions come from. The repository
 # is the curated github/ working copy (publish-github.cmd pushes it). Only files whose content differs are downloaded.
 [update]
-repo = "whompay/inFAMOUSreborn"
+# inFamous-PC-Enhanced: a fork of whompay/inFAMOUSreborn. Upstream changes arrive here through GitHub's "Sync fork".
+repo = "ibrahimpuri/inFamous-PC-Enhanced"
 branch = "main"
 # Folder inside the repository that holds this tree ("" = the repository root).
 path = ""

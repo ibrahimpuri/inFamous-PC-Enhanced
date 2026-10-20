@@ -19,6 +19,9 @@
 #include <math.h>
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#ifdef PS3RECOMP_SDL3
+#include "pad_sdl3.h"           /* PlayStation / Steam controllers through SDL3 (pad_sdl3.c) */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -760,6 +763,38 @@ static void pad_shutdown_backend(void)
 
 #endif /* PAD_BACKEND_XINPUT */
 
+#if defined(PS3RECOMP_SDL3) && PAD_BACKEND_XINPUT
+/* PlayStation / Steam controllers (pad_sdl3.c) take the host ports XInput left empty, in connection order.
+ * s_sdl_slot[port] = their pad_sdl3 index, for rumble (-1 = not an SDL pad). */
+static int s_sdl_slot[PAD_MAX_HOST_PORTS] = { -1, -1, -1, -1 };
+static void pad_merge_sdl3(void)
+{
+    PadSdlPad sp[PAD_MAX_HOST_PORTS];
+    const int ns = pad_sdl3_get(sp, PAD_MAX_HOST_PORTS);
+    int k = 0;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        s_sdl_slot[i] = -1;
+        if (s_host_state[i].connected || k >= ns) continue;
+        const PadSdlPad* p = &sp[k];
+        PadHostState* h = &s_host_state[i];
+        const u16 b = p->buttons;
+        h->connected = 1; h->buttons = b;
+        h->analog_lx = p->lx; h->analog_ly = p->ly; h->analog_rx = p->rx; h->analog_ry = p->ry;
+        h->trigger_l2 = p->l2; h->trigger_r2 = p->r2;
+        h->press_up = (b & CELL_PAD_CTRL_UP) ? 255 : 0;             h->press_down = (b & CELL_PAD_CTRL_DOWN) ? 255 : 0;
+        h->press_left = (b & CELL_PAD_CTRL_LEFT) ? 255 : 0;         h->press_right = (b & CELL_PAD_CTRL_RIGHT) ? 255 : 0;
+        h->press_triangle = (b & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0; h->press_circle = (b & CELL_PAD_CTRL_CIRCLE) ? 255 : 0;
+        h->press_cross = (b & CELL_PAD_CTRL_CROSS) ? 255 : 0;       h->press_square = (b & CELL_PAD_CTRL_SQUARE) ? 255 : 0;
+        h->press_l1 = (b & CELL_PAD_CTRL_L1) ? 255 : 0;             h->press_r1 = (b & CELL_PAD_CTRL_R1) ? 255 : 0;
+        /* controller activity -> controller prompts (sticks past ~37 %, like the XInput path) */
+        const int moved = p->lx < 80 || p->lx > 176 || p->ly < 80 || p->ly > 176 || p->rx < 80 || p->rx > 176 || p->ry < 80 || p->ry > 176;
+        if (b || moved) pad_note_device(0);
+        else if (g_input_kbm < 0) pad_note_device(0);
+        s_sdl_slot[i] = k++;
+    }
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * SDL2 backend
  * -----------------------------------------------------------------------*/
@@ -952,6 +987,9 @@ static void pad_poll_backend_do(void)
 #endif
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
+#ifdef PS3RECOMP_SDL3
+    pad_merge_sdl3();   /* PlayStation / Steam controllers into the ports XInput left empty */
+#endif
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
@@ -986,6 +1024,9 @@ static DWORD WINAPI pad_thread_main(LPVOID arg)
     (void)arg;
     InterlockedExchange(&s_pad_thread_live, 1);   /* v179 */
     while (s_pad_thread_run) {
+#ifdef PS3RECOMP_SDL3
+        pad_sdl3_update();   /* SDL3 gamepads: every SDL call happens on this thread */
+#endif
         pad_poll_backend_do();
         Sleep(PAD_POLL_INTERVAL_MS);
     }
@@ -1981,6 +2022,13 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     param = GUEST_PTR(param, CellPadActParam*);
+#if defined(PS3RECOMP_SDL3) && PAD_BACKEND_XINPUT
+    if (!pad_rumble_enabled()) return CELL_OK;   /* PAD_RUMBLE=0 */
+    if (port_no < PAD_MAX_HOST_PORTS && s_sdl_slot[port_no] >= 0) {   /* a PlayStation / Steam controller */
+        pad_sdl3_rumble(s_sdl_slot[port_no], param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL], param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE]);
+        return CELL_OK;
+    }
+#endif
 
 #if PAD_BACKEND_XINPUT
     /* Map to XInput vibration */

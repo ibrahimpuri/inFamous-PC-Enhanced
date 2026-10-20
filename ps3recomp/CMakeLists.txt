@@ -54,6 +54,23 @@ endif()
 # to a stub wherever the shader tools are absent, so it is part of the
 # library everywhere. See the "Guest shaders on Metal" section below.
 list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
+# Optional SDL3 gamepads for cellPad (libs/input/pad_sdl3.c: DualSense, DualShock 4, Steam Controller). Built only
+# when the SDL3 headers are present next to the checkout (sdl3/include); SDL3.dll is loaded at run time.
+set(PS3RECOMP_SDL3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../sdl3" CACHE PATH "SDL3 folder for PlayStation / Steam controllers (optional)")
+set(_ps3recomp_sdl3 OFF)
+if(WIN32 AND EXISTS "${PS3RECOMP_SDL3_DIR}/include/SDL3/SDL_gamepad.h")
+    set(_ps3recomp_sdl3 ON)
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_sdl3.c")
+endif()
+# Optional NVIDIA DLSS (DLAA) for the D3D12 backend (libs/video/rsx_dlss.cpp, DLSS=1 at run time). Built only when
+# the DLSS SDK files are present next to the checkout: dlss-sdk/include + lib/Windows_x86_64/x64/nvsdk_ngx_d.lib.
+set(PS3RECOMP_DLSS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../dlss-sdk" CACHE PATH "NVIDIA DLSS SDK folder (optional)")
+set(_ps3recomp_dlss OFF)
+if(WIN32 AND EXISTS "${PS3RECOMP_DLSS_SDK}/include/nvsdk_ngx.h"
+         AND EXISTS "${PS3RECOMP_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    set(_ps3recomp_dlss ON)
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_dlss.cpp")
+endif()
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
 file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
@@ -90,6 +107,23 @@ add_library(ps3recomp_runtime STATIC
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+if(_ps3recomp_dlss)
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_DLSS_SDK}/include")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_DLSS=1)
+    target_link_libraries(ps3recomp_runtime PUBLIC "${PS3RECOMP_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    message(STATUS "  DLSS:         ON (${PS3RECOMP_DLSS_SDK})")
+else()
+    message(STATUS "  DLSS:         off (no DLSS SDK in ${PS3RECOMP_DLSS_SDK})")
+endif()
+
+if(_ps3recomp_sdl3)
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_SDL3_DIR}/include")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_SDL3=1)
+    message(STATUS "  SDL3 pads:    ON (${PS3RECOMP_SDL3_DIR})")
+else()
+    message(STATUS "  SDL3 pads:    off (no SDL3 in ${PS3RECOMP_SDL3_DIR})")
+endif()
 
 # HLE modules include their own headers
 target_include_directories(ps3recomp_runtime PRIVATE

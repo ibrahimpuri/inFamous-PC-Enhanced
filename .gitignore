@@ -51,3 +51,20 @@ __pycache__/
 *.pyc
 *.pre_*
 *.bak
+
+# inFamous Launcher: per-player and third-party files (never committed)
+launcher/launcher.ini
+launcher/dlss5/
+launcher/dlss/backup/
+launcher/dlss/original/
+launcher/dlss/removed-upstream/
+launcher/dlss/build.log*
+dlss-sdk/
+save-backups/
+github/
+github-enhanced/
+# SDL3: only the headers and the x64 SDL3.dll are kept
+sdl3/cmake/
+sdl3/lib/x86/
+sdl3/lib/arm64/
+sdl3/lib/x64/*.lib
