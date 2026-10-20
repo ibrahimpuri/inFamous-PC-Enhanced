@@ -1005,8 +1005,8 @@ namespace InfamousLauncher
             // patches (DLSS, controllers, cheats) back right after it.
             bool patch = File.Exists(PortPatches.UpdateCmd(M));
             if (MessageBox.Show("This opens a console window that downloads the latest version of the port from GitHub and rebuilds the game if needed" +
-                                (patch ? ", then puts the launcher's patches (NVIDIA DLSS, PlayStation / Steam controllers, cheat mods) back" : "") +
-                                ". That can take a while.\n\nContinue?",
+                                (patch ? ", puts the launcher's patches (DLSS / FSR, controllers, cheat mods, language) back and rebuilds this launcher" : "") +
+                                ". That can take a while. Reopen the launcher when it's done.\n\nContinue?",
                                 "inFamous Launcher", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
             try { Process.Start(new ProcessStartInfo(patch ? PortPatches.UpdateCmd(M) : M.P.UpdateCmd) { UseShellExecute = true, WorkingDirectory = M.P.Root }); }
             catch (Exception e) { MessageBox.Show("Could not start the update: " + e.Message, "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning); }

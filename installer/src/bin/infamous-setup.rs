@@ -1128,7 +1128,13 @@ impl App {
                         (true, false) => "Start it any time from the desktop shortcut.".to_string(),
                         (false, true) => "Start it any time from the Start menu.".to_string(),
                         (false, false) => {
-                            format!("Start it any time with {}.exe in that folder.", self.title)
+                            format!(
+                                "Start it any time with {} in that folder.",
+                                setup::front_door(Path::new(self.location.trim()), &self.title)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            )
                         }
                     };
                     ui.label(RichText::new(s).small().color(MUTED));
@@ -1138,10 +1144,10 @@ impl App {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui
-                .add(primary(&format!("Play {}", self.title)).min_size(egui::vec2(200.0, 46.0)))
+                .add(primary(&format!("Start {}", self.title)).min_size(egui::vec2(200.0, 46.0)))
                 .clicked()
             {
-                let exe = Path::new(self.location.trim()).join(format!("{}.exe", self.title));
+                let exe = setup::front_door(Path::new(self.location.trim()), &self.title);
                 let _ = std::process::Command::new(exe)
                     .current_dir(self.location.trim())
                     .spawn();

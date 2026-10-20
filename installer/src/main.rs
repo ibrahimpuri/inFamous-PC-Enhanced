@@ -459,6 +459,7 @@ fn cmd_install(s: &Session) -> Result<()> {
     }
     let exe = build(s, &mut vars)?;
     let launcher = write_launcher(s, &vars, &exe, &elf)?;
+    build_settings_launcher(s);
     util::heading("Done");
     util::info(&format!("Start the game with: {}", launcher.display()));
     Ok(())
@@ -652,6 +653,61 @@ fn cmd_update(s: &Session) -> Result<()> {
     let _ = std::fs::remove_file(&pending_marker);
     util::info(&format!("Updated to version {short}."));
     Ok(())
+}
+
+/// The settings launcher (`launcher/build.cmd` -> `<game> Launcher.exe` in the checkout), built with the C#
+/// compiler of the Build Tools the game already needs. Rebuilt when its sources are newer than the exe, so an
+/// update that changed the launcher brings the new one. Never fatal: the game runs without it.
+fn build_settings_launcher(s: &Session) {
+    if !cfg!(windows) {
+        return;
+    }
+    let dir = s.root.join("launcher");
+    let script = dir.join("build.cmd");
+    if !script.is_file() {
+        return;
+    }
+    let exe = s.root.join(format!("{} Launcher.exe", s.m.game_title));
+    let newest = |p: &Path| -> Option<std::time::SystemTime> {
+        let mut t = None;
+        for e in std::fs::read_dir(p).ok()?.flatten() {
+            if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                t = t.max(Some(m));
+            }
+        }
+        t
+    };
+    let sources = [newest(&dir.join("src")), newest(&dir.join("assets")), std::fs::metadata(&script).and_then(|m| m.modified()).ok()]
+        .into_iter()
+        .flatten()
+        .max();
+    let built = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
+    if let (Some(b), Some(src)) = (built, sources) {
+        if b >= src {
+            util::info(&format!("{} is up to date.", exe.display()));
+            return;
+        }
+    }
+    util::heading("Settings launcher");
+    // A running launcher (it may have started this update) can't be overwritten, but it can be renamed;
+    // the next update removes the .old copy.
+    if exe.exists() && std::fs::remove_file(&exe).is_err() {
+        let old = exe.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&exe, &old);
+    }
+    match Command::new(&script).current_dir(&dir).output() {
+        Ok(o) if o.status.success() && exe.is_file() => util::info(&format!("Built {}", exe.display())),
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            let tail: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            util::warn(&format!(
+                "the settings launcher could not be built (the game itself is fine; run launcher\\build.cmd to see why): {}",
+                tail[tail.len().saturating_sub(3)..].join(" | ")
+            ));
+        }
+        Err(e) => util::warn(&format!("could not run {}: {e}", script.display())),
+    }
 }
 
 /// `Update <game>.cmd` next to the launcher: double-click to update.

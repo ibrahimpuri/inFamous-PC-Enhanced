@@ -699,6 +699,18 @@ impl Installer {
 }
 
 /// A folder holding a finished installation (the setup's files plus the installer's state).
+/// What the shortcuts open: the settings launcher (`<game> Launcher.exe`, built by the installer) when it is
+/// there, otherwise the game itself (`<game>.exe`).
+pub fn front_door(dir: &Path, game_title: &str) -> PathBuf {
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let gui = dir.join(format!("{game_title} Launcher{ext}"));
+    if gui.is_file() {
+        gui
+    } else {
+        dir.join(format!("{game_title}{ext}"))
+    }
+}
+
 pub fn is_installed(dir: &Path) -> bool {
     let ext = if cfg!(windows) { ".exe" } else { "" };
     dir.join("installer")
@@ -941,7 +953,7 @@ fn install(
 
     // 4. Shortcuts.
     set(0.995, "Creating shortcuts", "");
-    let launcher = o.location.join(format!("{}{ext}", o.game_title));
+    let launcher = front_door(&o.location, &o.game_title);
     let mut links = Vec::new();
     if o.desktop_shortcut {
         if let Some(d) = shell_folder("Desktop") {

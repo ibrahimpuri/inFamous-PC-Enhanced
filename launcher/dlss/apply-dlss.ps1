@@ -426,11 +426,13 @@ $hasNgx = @('include\nvsdk_ngx.h', 'lib\Windows_x86_64\x64\nvsdk_ngx_d.lib', 'li
 $fsr = Join-Path $root 'fsr-sdk'
 $hasFfx = (Test-Path (Join-Path $fsr 'Kits\FidelityFX\upscalers\include\ffx_upscale.h')) -and
           (Test-Path (Join-Path $fsr 'Kits\FidelityFX\signedbin\amd_fidelityfx_loader_dx12.dll'))
+# Neither is an error: the controllers, the cheat mods and the language need no SDK, and the game builds without them.
 if (-not $hasNgx -and -not $hasFfx) {
-    Fail "neither the NVIDIA DLSS SDK ($sdk) nor the AMD FSR SDK ($fsr) is there. Download the DLSS SDK from https://github.com/NVIDIA/DLSS (v310.9.16 or newer) into $sdk, and/or the AMD FSR SDK files (see README.md) into $fsr."
+    Write-Host "  note: no NVIDIA DLSS SDK ($sdk) and no AMD FSR SDK ($fsr) -- the game is built without DLSS / FSR upscaling;" -ForegroundColor Yellow
+    Write-Host "        everything else works. To add them later, see launcher\dlss\README.md, then run this again." -ForegroundColor Yellow
 }
-if (-not $hasNgx) { Write-Host "  note: no DLSS SDK in $sdk -- the game is built without NVIDIA DLSS" -ForegroundColor Yellow }
-if (-not $hasFfx) { Write-Host "  note: no AMD FSR SDK in $fsr -- the game is built without AMD FSR" -ForegroundColor Yellow }
+elseif (-not $hasNgx) { Write-Host "  note: no DLSS SDK in $sdk -- the game is built without NVIDIA DLSS" -ForegroundColor Yellow }
+elseif (-not $hasFfx) { Write-Host "  note: no AMD FSR SDK in $fsr -- the game is built without AMD FSR" -ForegroundColor Yellow }
 foreach ($f in $backend, $cellpad, $cmake, $stubs, $sysutil) { if (-not (Test-Path $f)) { Fail "$f not found." } }
 if (-not (Test-Path (Join-Path $root 'sdl3\include\SDL3\SDL_gamepad.h'))) {
     Write-Host '  note: no SDL3 in <game>\sdl3 -- the game is built with Xbox (XInput) controllers only' -ForegroundColor Yellow
@@ -472,6 +474,9 @@ if (-not (Test-Path $cache)) { Fail "no build folder at $BuildDir -- run Update 
 $m = Select-String -Path $cache -Pattern '^CMAKE_MAKE_PROGRAM:[A-Z]+=(.+)$'
 if (-not $m) { Fail "CMAKE_MAKE_PROGRAM is not set in $cache." }
 $ninja = $m.Matches[0].Groups[1].Value
+# CMake looks for the SDKs when it configures: re-run it (with the cached settings) so one added since is picked up.
+$c = Select-String -Path $cache -Pattern '^CMAKE_COMMAND:[A-Z]+=(.+)$'
+$cmakeExe = if ($c) { $c.Matches[0].Groups[1].Value } else { $null }
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $vs = if (Test-Path $vswhere) { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } else { $null }
 $vcvars = if ($vs) { Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat' } else { '' }
@@ -486,6 +491,8 @@ Set-Content -Path $bat -Encoding ASCII -Value @(
     "call `"$vcvars`" >nul",
     'if errorlevel 1 exit /b 1',
     "cd /d `"$BuildDir`"",
+    $(if ($cmakeExe -and (Test-Path $cmakeExe)) { "`"$cmakeExe`" . >nul" } else { 'rem no cmake.exe in the cache: ninja re-runs CMake itself when CMakeLists changed' }),
+    'if errorlevel 1 exit /b 1',
     "`"$ninja`"")
 Write-Host 'Building the game (a few minutes)...'
 $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', "`"$bat`"" -NoNewWindow -Wait -PassThru `
@@ -493,7 +500,7 @@ $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', "`"$bat`"" -NoNewWind
 Remove-Item -LiteralPath $bat -ErrorAction SilentlyContinue
 $obj = Get-ChildItem -Path $BuildDir -Recurse -Filter 'rsx_dlss.cpp.obj' -ErrorAction SilentlyContinue | Select-Object -First 1
 $after = if (Test-Path $exe) { (Get-Item $exe).LastWriteTimeUtc } else { [datetime]::MinValue }
-if ($p.ExitCode -ne 0 -or -not $obj) {
+if ($p.ExitCode -ne 0 -or (($hasNgx -or $hasFfx) -and -not $obj)) {
     Write-Host ''
     Get-Content $log -Tail 25 | Where-Object { $_ -match 'error|FAILED' } | Select-Object -First 12 | ForEach-Object { Write-Host "  $_" }
     foreach ($w in $written) { Copy-Item -LiteralPath (Join-Path $bk (Split-Path $w[0] -Leaf)) -Destination $w[0] -Force }
@@ -501,5 +508,6 @@ if ($p.ExitCode -ne 0 -or -not $obj) {
     Fail "the build failed (full log: $log). The game source was put back as it was. $state"
 }
 Write-Host ''
-Write-Host 'DLSS / FSR, the cheat mods, PlayStation / Steam controller support and the game language are back in the game.' -ForegroundColor Green
+if ($hasNgx -or $hasFfx) { Write-Host 'DLSS / FSR, the cheat mods, PlayStation / Steam controller support and the game language are back in the game.' -ForegroundColor Green }
+else { Write-Host 'The cheat mods, PlayStation / Steam controller support and the game language are back in the game (no DLSS / FSR: no SDK).' -ForegroundColor Green }
 exit 0
