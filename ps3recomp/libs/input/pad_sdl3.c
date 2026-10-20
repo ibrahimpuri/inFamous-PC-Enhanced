@@ -8,6 +8,10 @@
  *
  * All SDL calls happen on cellPad's host poll thread (pad_sdl3_update); the guest side only reads a snapshot and
  * leaves rumble requests, which that thread applies. */
+/* Built only with the launcher's CMake hook, which adds the SDL3 headers and defines PS3RECOMP_SDL3. The port's
+ * CMakeLists globs libs/input/*.c, so after an update that restores the upstream CMakeLists (hook gone) this file
+ * is still compiled: it then compiles to nothing and the game builds without PlayStation / Steam controllers. */
+#ifdef PS3RECOMP_SDL3
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -269,3 +273,5 @@ void pad_sdl3_rumble(int index, uint8_t small_motor, uint8_t large_motor)
     /* libpad: the small motor is on/off (0 or 1), the large one 0..255 */
     InterlockedExchange(&s_rumble_req[index], (LONG)((small_motor ? 0xFF00u : 0u) | large_motor));
 }
+
+#endif   /* PS3RECOMP_SDL3 */

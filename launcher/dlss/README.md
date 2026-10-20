@@ -62,9 +62,24 @@ It needs an NVIDIA RTX graphics card. On other cards, or with DLSS off, the game
 - **Do it from the launcher:** don't delete files by hand. Starting the game with `inFamous.exe` instead of the launcher uses whatever the last launcher Play installed.
 - **Status:** `"inFamous Launcher.exe" --dry-run FILE` reports the switch's state in its `dlss5=` line.
 
-## After "Update inFamous"
+## After "Update inFamous" or a repair
 
-An update replaces the game's source with the upstream version and rebuilds the game. That removes DLSS, the hook behind the launcher's cheat mods (Infinite XP, Max Karma, Unlock All Powers) and the PlayStation / Steam controller support. Then run **`apply-dlss.cmd`** in this folder. It puts all three back and rebuilds the game, which takes a few minutes. If an update only reverted some of the files, it adds just the hooks that are missing.
+An update or a repair restores the port's own copies of the four files the patches hook into, and rebuilds the game. That removes:
+- DLSS;
+- the hook behind the launcher's cheat mods (Infinite XP, Max Karma, Unlock All Powers);
+- the PlayStation / Steam controller support.
+
+The launcher's own files stay, and the game still builds and runs without them.
+
+**Getting them back:**
+- **Update from the launcher:** Tools › **Update now** runs `update-and-patch.cmd`. It runs the update, then this script, so nothing goes missing.
+- **Updated another way** (the *Update inFamous* shortcut, or a repair): the launcher notices the missing hooks.
+  - The bottom bar says so.
+  - Play offers to put them back.
+  - Tools › **Re-apply launcher patches** runs **`apply-dlss.cmd`**, which you can also run yourself.
+
+The script puts all three back and rebuilds the game, which takes a few minutes. If only some files were reverted, it adds just the hooks that are missing.
+- **The build can't break:** `pad_sdl3.c` compiles to nothing without its CMake hook. The port's CMakeLists compiles every `libs\input\*.c`, so before this guard an update or repair failed with `'SDL3/SDL_init.h' file not found`.
 - **Safe to repeat:** running it twice is harmless. A file that already has the hooks is left alone.
 - **Backups:** the files as they were before patching are kept in `backup\<date-time>`.
 - **When it stops with "has to be ported by hand":** the update changed code next to one of the hooks. Nothing has been written, and the game runs fine without DLSS. The DLSS switch then simply does nothing.
@@ -78,7 +93,8 @@ An update replaces the game's source with the upstream version and rebuilds the 
 | `src\infamous_cheats.h` | the cheat module behind the launcher's cheat mods, and the karma light bar; the script copies it to `infamous-recomp` |
 | `src\pad_sdl3.c`, `src\pad_sdl3.h` | DualSense / DualShock 4 / Steam Controller support through SDL3 (`..\..\sdl3`); the script copies them to `ps3recomp\libs\input` |
 | `apply-dlss.ps1` / `.cmd` | re-applies the hooks in `rsx_d3d12_backend.c`, `cellPad.c`, `ps3recomp\CMakeLists.txt` and `infamous-recomp\stubs.cpp`, then rebuilds |
-| `original\` | the upstream files as they were before the patches were first added |
+| `update-and-patch.cmd` | the launcher's *Update now*: `infamous-installer update`, then `apply-dlss.ps1` |
+| `original\` | the upstream files without the patches (refreshed to upstream `cdb581579f`), for testing the script |
 | `removed-upstream\` | stale `rsx_skate_actor.*` files an upstream update had left behind. They broke the build, so they were moved here |
 | `..\..\dlss-sdk\` | NVIDIA DLSS SDK 310.9.16 (headers, import library, `nvngx_dlss.dll`); see its `LICENSE.txt` |
 

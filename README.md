@@ -303,9 +303,12 @@ On a slower CPU, the **Potato PC** preset (with Low-end CPU mode) and the adapti
 
 - **Players of this fork:** use **Update inFamous** once your install points at this repository (step 3 above).
 - **Upstream changes** reach this fork through GitHub's **Sync fork** button.
-- **Installs that track upstream (whompay/inFAMOUSreborn):** after each upstream update, run `launcher\dlss\apply-dlss.cmd` to put DLSS, the cheats and the controller support back. Each hook is placed next to a line that must appear exactly once.
-  - If an update changed one of those lines, nothing is written, and you're told which patch needs porting by hand.
-  - If the build fails, the source is restored.
+- **Installs that track upstream (whompay/inFAMOUSreborn):** an upstream update or a repair restores the port's own copies of the four files this fork hooks into. That removes DLSS, the cheats and the controller support. The game still builds and runs without them.
+  - **Putting them back:**
+    - **Update from the launcher:** Tools › **Update now** re-applies them right after the update (`launcher\dlss\update-and-patch.cmd`).
+    - **Updated another way:** the launcher notices the missing hooks. The bottom bar says so, Play offers to put them back, and Tools › **Re-apply launcher patches** runs `launcher\dlss\apply-dlss.cmd`.
+  - **How the hooks are placed:** each one goes next to a line that must appear exactly once. If an update changed one of those lines, nothing is written, and you're told which patch needs porting by hand.
+  - **If the build fails:** the source is restored.
 
 ## Project layout
 

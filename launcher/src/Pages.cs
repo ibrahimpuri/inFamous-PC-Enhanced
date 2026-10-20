@@ -860,12 +860,21 @@ namespace InfamousLauncher
             }
             catch { }
             string inst = M.P.InstallerExe;
+            var gone = PortPatches.Missing(M);
+            bool canPatch = File.Exists(PortPatches.ApplyCmd(M));
             s.Children.Add(Section("Updates & repair",
-                "Updates come from GitHub" + (repo != null ? " (" + repo + ")" : "") + ". Only the files that changed are downloaded, then whatever they affect is rebuilt.",
+                "Updates come from GitHub" + (repo != null ? " (" + repo + ")" : "") + ". Only the files that changed are downloaded, then whatever they affect is rebuilt." +
+                (canPatch ? " Update now also puts the launcher's patches (DLSS, controllers, cheat mods) back afterwards." : ""),
                 new UIElement[]
                 {
-                    Padded(VStack(HStack(Btn("Check for updates", () => RunTool(toolOut, inst, "update --check --root \"" + M.P.Root + "\""), "Btn", "\uE895"),
+                    Padded(VStack(gone.Count > 0
+                                      ? Note("\uE7BA", "An update or repair replaced the port files the launcher patches, so " + PortPatches.Describe(gone) + " missing from the game. Re-apply the patches to put them back (it rebuilds the game, a few minutes).",
+                                             "Warn", "WarnSoft", new Thickness(0, 0, 0, 10))
+                                      : null,
+                                  HStack(Btn("Check for updates", () => RunTool(toolOut, inst, "update --check --root \"" + M.P.Root + "\""), "Btn", "\uE895"),
                                          Btn("Update now", UpdateNow, "Primary", "\uE896"),
+                                         canPatch ? Btn("Re-apply launcher patches", ReapplyPatches, gone.Count > 0 ? "Primary" : "Btn", "\uE90F",
+                                                        "Puts NVIDIA DLSS, PlayStation / Steam controller support and the cheat mods back into the port and rebuilds the game") : null,
                                          Btn("Check prerequisites", () => RunTool(toolOut, inst, "doctor --root \"" + M.P.Root + "\""), "Btn", "\uE9D9")),
                                   toolOut), 20, 14, 20, 6)
                 }));
@@ -958,10 +967,25 @@ namespace InfamousLauncher
         {
             if (Running) { MessageBox.Show("Close the game before updating.", "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Information); return; }
             if (!File.Exists(M.P.UpdateCmd)) { MessageBox.Show(M.P.UpdateCmd + " was not found. Run inFamous Setup again.", "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning); return; }
-            if (MessageBox.Show("This opens a console window that downloads the latest version of the port from GitHub and rebuilds the game if needed. That can take a while.\n\nContinue?",
+            // An update restores the port's own copies of the files the launcher patches; update-and-patch.cmd puts the
+            // patches (DLSS, controllers, cheats) back right after it.
+            bool patch = File.Exists(PortPatches.UpdateCmd(M));
+            if (MessageBox.Show("This opens a console window that downloads the latest version of the port from GitHub and rebuilds the game if needed" +
+                                (patch ? ", then puts the launcher's patches (NVIDIA DLSS, PlayStation / Steam controllers, cheat mods) back" : "") +
+                                ". That can take a while.\n\nContinue?",
                                 "inFamous Launcher", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
-            try { Process.Start(new ProcessStartInfo(M.P.UpdateCmd) { UseShellExecute = true, WorkingDirectory = M.P.Root }); }
+            try { Process.Start(new ProcessStartInfo(patch ? PortPatches.UpdateCmd(M) : M.P.UpdateCmd) { UseShellExecute = true, WorkingDirectory = M.P.Root }); }
             catch (Exception e) { MessageBox.Show("Could not start the update: " + e.Message, "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning); }
+        }
+
+        // Re-applies the launcher's port patches and rebuilds the game, in a console window (apply-dlss.cmd).
+        void ReapplyPatches()
+        {
+            if (Running) { MessageBox.Show("Close the game first.", "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Information); return; }
+            string cmd = PortPatches.ApplyCmd(M);
+            if (!File.Exists(cmd)) { MessageBox.Show(cmd + " was not found.", "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning); return; }
+            try { Process.Start(new ProcessStartInfo(cmd) { UseShellExecute = true, WorkingDirectory = PortPatches.Dir(M) }); }
+            catch (Exception e) { MessageBox.Show("Could not start it: " + e.Message, "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning); }
         }
 
         void BackupSaves()

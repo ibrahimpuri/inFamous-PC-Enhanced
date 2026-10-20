@@ -818,6 +818,45 @@ namespace InfamousLauncher
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // The launcher's port patches (launcher\dlss\apply-dlss.ps1): NVIDIA DLSS, PlayStation / Steam controllers and
+    // the cheat mods hook into four port files. "Update inFamous" and a repair restore the port's own copies of those
+    // files, which drops the hooks; Missing() tells which features are gone so the launcher can offer to re-apply.
+    // ---------------------------------------------------------------------------------------------------------
+    static class PortPatches
+    {
+        public static string Dir(Model m) { return Path.Combine(m.P.LauncherDir, "dlss"); }
+        public static string ApplyCmd(Model m) { return Path.Combine(Dir(m), "apply-dlss.cmd"); }
+        public static string UpdateCmd(Model m) { return Path.Combine(Dir(m), "update-and-patch.cmd"); }
+
+        // "A", "A and B", "A, B and C" + " is" / " are"
+        public static string Describe(List<string> gone)
+        {
+            string list = gone.Count == 1 ? gone[0] : string.Join(", ", gone.Take(gone.Count - 1)) + " and " + gone[gone.Count - 1];
+            return list + (gone.Count == 1 ? " is" : " are");
+        }
+
+        // Feature names whose hooks are missing (empty when all are in place, or when the patch scripts aren't here).
+        public static List<string> Missing(Model m)
+        {
+            var gone = new List<string>();
+            if (!File.Exists(Path.Combine(Dir(m), "apply-dlss.ps1"))) return gone;
+            string ps3 = Path.Combine(m.P.Root, "ps3recomp");
+            Func<string, string, bool> has = (file, marker) =>
+            {
+                try { return File.Exists(file) && File.ReadAllText(file).Contains(marker); }
+                catch { return true; }   // unreadable: don't nag
+            };
+            if (!has(Path.Combine(ps3, "CMakeLists.txt"), "_ps3recomp_dlss") || !has(Path.Combine(ps3, "libs", "video", "rsx_d3d12_backend.c"), "rsx_dlss_"))
+                gone.Add("NVIDIA DLSS");
+            if (!has(Path.Combine(ps3, "CMakeLists.txt"), "_ps3recomp_sdl3") || !has(Path.Combine(ps3, "libs", "input", "cellPad.c"), "pad_sdl3"))
+                gone.Add("PlayStation / Steam controllers");
+            if (!has(Path.Combine(m.Port, "stubs.cpp"), "infamous_cheats"))
+                gone.Add("the cheat mods");
+            return gone;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // DLSS 5 Neural Rendering through OptiScaler. The player extracts OptiScaler-DLSSNR (and NVIDIA's
     // nvngx_dlssnr.dll) into launcher\dlss5. On Play the launcher installs it beside the game exe with
     // OptiScaler.dll named dxgi.dll -- the exe imports dxgi.dll, so Windows loads that copy first -- and removes

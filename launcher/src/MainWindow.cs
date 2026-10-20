@@ -335,9 +335,13 @@ namespace InfamousLauncher
         // Rebuild the page on screen, keeping its scroll position (after a reset, a preset or a reload).
         void RebuildPage() { BuildPage(pageScroll != null ? pageScroll.VerticalOffset : 0); }
 
+        List<string> patchesGone = new List<string>();   // PortPatches.Missing, refreshed on page builds and activation
+        bool patchAsked;                                  // Play asked about missing patches this session
+
         void BuildPage(double scroll)
         {
             refreshers.Clear();
+            try { patchesGone = PortPatches.Missing(M); } catch { patchesGone = new List<string>(); }
             heroPlay = null; heroStatus = null; heroDot = null;
             UIElement content;
             switch (page)
@@ -389,6 +393,7 @@ namespace InfamousLauncher
                 reload = true;
             }
             else if (M.IniChangedOnDisk()) { M.ReloadIni(); reload = true; }
+            try { var g = PortPatches.Missing(M); if (g.Count != patchesGone.Count) { patchesGone = g; reload = true; } } catch { }
             if (reload && page != null && !IsTyping()) RebuildPage();
         }
         bool IsTyping() { return Keyboard.FocusedElement is TextBox; }
@@ -412,6 +417,15 @@ namespace InfamousLauncher
             if (Running) return;
             string why = BlockReason();
             if (why != null) { MessageBox.Show(why, "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning); return; }
+            if (patchesGone.Count > 0 && !patchAsked)
+            {
+                patchAsked = true;
+                var r = MessageBox.Show("An update or repair replaced the port files the launcher patches, so " + PortPatches.Describe(patchesGone) + " missing from the game.\n\nPut them back now? That rebuilds the game in a console window " +
+                                        "(a few minutes); press Play again when it has finished.\n\nNo starts the game without them.",
+                                        "inFamous Launcher", MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
+                if (r == MessageBoxResult.Yes) { ReapplyPatches(); return; }
+                if (r != MessageBoxResult.No) { patchAsked = false; return; }
+            }
             try
             {
                 saveTimer.Stop();
@@ -497,6 +511,7 @@ namespace InfamousLauncher
             }
             else if (why != null) { text = why; dot = "Bad"; canPlay = false; }
             else { text = (lastMessage != null ? lastMessage + "   " : "") + "Ready · " + Summary(); dot = "Accent"; canPlay = true; }
+            if (!Running && why == null && patchesGone.Count > 0) { text = "Launcher patches missing after an update (Tools › Re-apply launcher patches) · " + text; dot = "Warn"; }
 
             barText.Text = text; barText.ToolTip = text; barDot.Fill = B(dot);
             barPlay.IsEnabled = canPlay;

@@ -43,7 +43,7 @@ Enabled mods are applied after your own settings (and lock the settings they cha
 
 - **Saving keeps the changes.** Once you save with a cheat on, the extra XP, karma or powers stay in that save even after you turn the mod off. Back up the save first (Saved Data page) if you want to keep a clean one.
 - **New Game:** a new game started with Unlock All Powers on has every power from the first mission.
-- **After "Update inFamous":** the update removes the hook, so run `dlss\apply-dlss.cmd` to put it back. That script re-applies DLSS and the cheats together.
+- **After an update or repair:** the hook is removed. Tools › **Update now** puts it back automatically; otherwise use Tools › **Re-apply launcher patches** (`dlss\apply-dlss.cmd`), which re-applies DLSS, the controllers and the cheats together.
 The nine in-game menu settings can't be set by a mod. `mods\traffic-popin` is an example. `mods\skate` (Skate Mode)
 needs its own build with `PORT_SKATE_MOD=ON`; the launcher detects such a build next to `build-install`.
 
@@ -73,7 +73,7 @@ The **Controller** page lists every connected controller with its type, connecti
 - **Steam Controller with Steam open:** if Steam is open while you play, it also turns the Steam Controller into mouse and keyboard input. Either close Steam, or add the game to Steam and play through Steam Input with "Read Steam Controllers directly" switched off.
 - **DS4Windows / DSX:** these add a second, virtual Xbox controller. Close them, or let them hide the real one.
 
-SDL3 (3.4.18, zlib licence) sits in `sdl3\` next to the game. The game loads `SDL3.dll` from there when it starts; without it, only XInput controllers work. After "Update inFamous", run `dlss\apply-dlss.cmd`: it re-applies the controller support with the other patches.
+SDL3 (3.4.18, zlib licence) sits in `sdl3\` next to the game. The game loads `SDL3.dll` from there when it starts; without it, only XInput controllers work. After an update or repair, the controller support is put back with the other patches (see the DLSS section).
 
 ## NVIDIA DLSS (DLAA and upscaling)
 
@@ -84,9 +84,12 @@ models. The modes:
   rebuilds the image at full size. The game is mostly CPU-limited, so they lower GPU load and heat more than they
   raise FPS. At 720p output there is nothing to upscale, and they act as DLAA.
 
-DLSS is added to the port's renderer by this launcher, not by upstream, so **after every "Update inFamous" run
-`dlss\apply-dlss.cmd`** to put it back and rebuild the game. Details, limits and debug switches:
-[dlss\README.md](dlss/README.md).
+DLSS is added to the port's renderer by this launcher, not by upstream. An update or a repair restores the port's own
+files and so removes it, together with the controller support and the cheat hook.
+- **Updating from the launcher:** Tools › **Update now** puts them back right after updating.
+- **Updated another way:** the launcher notices the missing hooks. The bottom bar says so, Play offers to re-apply them, and Tools › **Re-apply launcher patches** runs `dlss\apply-dlss.cmd`.
+
+Details, limits and debug switches: [dlss\README.md](dlss/README.md).
 
 **DLSS 5 Neural Rendering** (same page) runs NVIDIA's DLSS 5 model over the DLSS image through OptiScaler-DLSSNR, a
 community mod kept in `dlss5\`. When the switch is on, Play installs it beside the game exe as `dxgi.dll`; when it is
