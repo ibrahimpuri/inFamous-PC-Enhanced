@@ -243,6 +243,37 @@ s32 cellSysutilCheckCallback(void)
     return CELL_OK;
 }
 
+/* inFamous launcher: the PS3 system language the game reads -- PS3_LANG, a name (english, british, french, german,
+ * spanish, italian, dutch, polish, portuguese, russian, ...) or the CELL_SYSUTIL_LANG_ number; default English (US).
+ * inFamous has no language menu: its spoken dialogue, text and subtitles follow this. The title's hook (inFamous:
+ * infamous_lang.h) runs when the game reads it. */
+__declspec(selectany) void (*g_sysutil_lang_hook)(int) = NULL;
+static int sysutil_lang_eq(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) { char x = *a, y = *b; if (x >= 'A' && x <= 'Z') x += 32; if (y >= 'A' && y <= 'Z') y += 32; if (x != y) return 0; }
+    return *a == *b;
+}
+static s32 sysutil_lang_from_env(void)
+{
+    static s32 lang = -1;
+    if (lang >= 0) return lang;
+    static const struct { const char* n; s32 v; } k[] = {
+        { "japanese", 0 }, { "english", 1 }, { "english_us", 1 }, { "french", 2 }, { "spanish", 3 }, { "german", 4 },
+        { "italian", 5 }, { "dutch", 6 }, { "portuguese", 7 }, { "portuguese_pt", 7 }, { "russian", 8 }, { "korean", 9 },
+        { "chinese_t", 10 }, { "chinese_s", 11 }, { "finnish", 12 }, { "swedish", 13 }, { "danish", 14 }, { "norwegian", 15 },
+        { "polish", 16 }, { "portuguese_br", 17 }, { "english_gb", 18 }, { "british", 18 }, { "turkish", 19 } };
+    lang = CELL_SYSUTIL_LANG_ENGLISH_US;
+    const char* e = getenv("PS3_LANG");
+    if (e && *e) {
+        char* end = NULL;
+        const long n = strtol(e, &end, 10);
+        if (end && end != e && !*end && n >= 0 && n <= 19) lang = (s32)n;
+        else for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) if (sysutil_lang_eq(e, k[i].n)) { lang = k[i].v; break; }
+    }
+    printf("[cellSysutil] system language %d (PS3_LANG=%s)\n", (int)lang, (e && *e) ? e : "not set");
+    return lang;
+}
+
 /* value_ea is a GUEST address, and it is spelt as one. It used to be declared
  * s32* and immediately cast back to a guest EA, with a comment explaining that
  * dereferencing it as a host pointer faults -- true, and no help to a caller
@@ -262,7 +293,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     s32 v = 0;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = CELL_SYSUTIL_LANG_ENGLISH_US;
+        v = sysutil_lang_from_env(); if (g_sysutil_lang_hook) g_sysutil_lang_hook((int)v);   /* inFamous launcher: PS3_LANG */
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;

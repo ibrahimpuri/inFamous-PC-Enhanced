@@ -98,12 +98,42 @@ With only the FSR SDK and no DLSS SDK, the game is built with FSR alone, and the
 - **Do it from the launcher:** don't delete files by hand. Starting the game with `inFamous.exe` instead of the launcher uses whatever the last launcher Play installed.
 - **Status:** `"inFamous Launcher.exe" --dry-run FILE` reports the switch's state in its `dlss5=` line.
 
+## Game language
+
+inFamous has no language menu: it follows the PS3's system language. The launcher's **Display › Language** sets it through `PS3_LANG`, a name from the table below or a `CELL_SYSUTIL_LANG_` number.
+
+**Why it needs two hooks:**
+- **`cellSysutil.c`:** the port always reported English (US). The system language now comes from `PS3_LANG`.
+- **`src\infamous_lang.h`:** that alone only gave French and Spanish.
+  - **How the game picks:** it works out which release it is from the title ID the port reports, matched against the seven it knows (`BCUS98119`, `BCES00220`, `BCES00591`, `BCES00609`, `BCAS20074`, `BCET00010`, `BCET00220`). Each release offers only the languages it shipped with.
+  - **Why it fell back:** the port reports `BLES00000`, which matches none of them, so the game took the US release: English, French and Spanish.
+  - **The fix:** when the game reads the system language, the hook points the US release's language list at the chosen language. The game's own lists already hold every European language.
+  - **Saves stay put:** reporting a real release ID would have moved the save folder, because the game names it after that ID. The ID stays the same, so saves work in every language.
+
+| Language | `PS3_LANG` | Voices | Text and subtitles |
+|---|---|---|---|
+| English | *(unset)*, `english` | English | English |
+| English (UK) | `british` | English | British English |
+| French | `french` | French | French |
+| German | `german` | German | German |
+| Italian | `italian` | Italian | Italian |
+| Spanish | `spanish` | Spanish | Spanish |
+| Dutch | `dutch` | Dutch | Dutch |
+| Polish | `polish` | Polish | Polish |
+| Portuguese | `portuguese` | Portuguese | Portuguese |
+| Russian | `russian` | Russian | Russian |
+| Korean | `korean` | English (none on the disc) | Korean |
+| Chinese | `chinese_s` | English (none on the disc) | Chinese |
+
+All twelve were run on the test PC: each one loaded its own dialogue archive (`dialog\archive\<language>.psarc`) and showed the HUD's karma rank in that language. The disc has Korean and Chinese text and subtitles, but no voices in them.
+
 ## After "Update inFamous" or a repair
 
-An update or a repair restores the port's own copies of the four files the patches hook into, and rebuilds the game. That removes:
+An update or a repair restores the port's own copies of the five files the patches hook into, and rebuilds the game. That removes:
 - DLSS;
 - the hook behind the launcher's cheat mods (Infinite XP, Max Karma, Unlock All Powers);
-- the PlayStation / Steam controller support.
+- the PlayStation / Steam controller support;
+- the game language (the launcher's Language setting goes back to English).
 
 The launcher's own files stay, and the game still builds and runs without them.
 
@@ -114,7 +144,7 @@ The launcher's own files stay, and the game still builds and runs without them.
   - Play offers to put them back.
   - Tools › **Re-apply launcher patches** runs **`apply-dlss.cmd`**, which you can also run yourself.
 
-The script puts all three back and rebuilds the game, which takes a few minutes. If only some files were reverted, it adds just the hooks that are missing.
+The script puts them all back and rebuilds the game, which takes a few minutes. If only some files were reverted, it adds just the hooks that are missing.
 - **The build can't break:** `pad_sdl3.c` compiles to nothing without its CMake hook. The port's CMakeLists compiles every `libs\input\*.c`, so before this guard an update or repair failed with `'SDL3/SDL_init.h' file not found`.
 - **Safe to repeat:** running it twice is harmless. A file that already has the hooks is left alone.
 - **Backups:** the files as they were before patching are kept in `backup\<date-time>`.
@@ -127,13 +157,14 @@ The script puts all three back and rebuilds the game, which takes a few minutes.
 |---|---|
 | `src\rsx_dlss.cpp`, `src\rsx_dlss.h` | the DLSS module; the script copies them to `ps3recomp\libs\video` |
 | `src\infamous_cheats.h` | the cheat module behind the launcher's cheat mods, and the karma light bar; the script copies it to `infamous-recomp` |
+| `src\infamous_lang.h` | the game language behind the launcher's Language setting (see [Game language](#game-language)); the script copies it to `infamous-recomp` |
 | `src\pad_sdl3.c`, `src\pad_sdl3.h` | DualSense / DualShock 4 / Steam Controller support through SDL3 (`..\..\sdl3`); the script copies them to `ps3recomp\libs\input` |
-| `apply-dlss.ps1` / `.cmd` | re-applies the hooks in `rsx_d3d12_backend.c`, `cellPad.c`, `ps3recomp\CMakeLists.txt` and `infamous-recomp\stubs.cpp`, then rebuilds |
+| `apply-dlss.ps1` / `.cmd` | re-applies the hooks in `rsx_d3d12_backend.c`, `cellPad.c`, `cellSysutil.c`, `ps3recomp\CMakeLists.txt` and `infamous-recomp\stubs.cpp`, then rebuilds |
 | `update-and-patch.cmd` | the launcher's *Update now*: `infamous-installer update`, then `apply-dlss.ps1` |
 | `original\` | the upstream files without the patches (refreshed to upstream `cdb581579f`), for testing the script |
 | `removed-upstream\` | stale `rsx_skate_actor.*` files an upstream update had left behind. They broke the build, so they were moved here |
 | `..\..\dlss-sdk\` | NVIDIA DLSS SDK 310.9.16 (headers, import library, `nvngx_dlss.dll`); see its `LICENSE.txt` |
-| `..\..sr-sdk\` | AMD FSR SDK 2.3.0 files (headers + the signed loader / upscaler / frame generation DLLs); see `docs\license.md` |
+| `..\..\fsr-sdk\` | AMD FSR SDK 2.3.0 files (headers + the signed loader / upscaler / frame generation DLLs); see `docs\license.md` |
 
 ## How it works
 

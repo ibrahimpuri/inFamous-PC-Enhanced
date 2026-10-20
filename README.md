@@ -30,6 +30,7 @@ It adds:
 - [AMD FSR and frame generation](#amd-fsr-and-frame-generation)
 - [ReShade](#reshade)
 - [Potato PC and low-end CPUs](#potato-pc-and-low-end-cpus)
+- [Languages](#languages)
 - [Controllers](#controllers)
 - [Mods and cheats](#mods-and-cheats)
 - [Performance and how it's optimised](#performance-and-how-its-optimised)
@@ -49,6 +50,7 @@ It adds:
 | 🧠 | **DLSS 5 Neural Rendering** *(optional)* | One switch installs [OptiScaler](https://github.com/optiscaler/OptiScaler)-DLSSNR beside the game so NVIDIA's DLSS 5 model runs on top of DLSS. Bring your own files (see below) |
 | 🎨 | **ReShade** | A launcher page with four looks (Natural, Remastered, Vivid, Cinematic) and sliders. The effects in [`inFamous.fx`](launcher/reshade/shaders/inFamous.fx) were written for this game, including depth-based ambient occlusion that works with DLSS upscaling. Bring your own ReShade (one button) |
 | 🥔 | **Potato PC preset + Low-end CPU mode** | On four cores the shipped thread setup livelocked; Low-end CPU mode fixes it. On a budget-quad-core stand-in the game goes from never loading to about 49 FPS |
+| 🌍 | **Every language on the disc** | Display › Language: English, English (UK), French, German, Italian, Spanish, Dutch, Polish, Portuguese and Russian with their voices, plus Korean and Chinese text. The port used to offer only English, French and Spanish. Saves work in every language |
 | 🎮 | **PlayStation and Steam controllers** | DualSense, DualSense Edge, DualShock 4, Steam Controller and Switch Pro, by USB or Bluetooth, through SDL3. Includes rumble, a light bar that can follow Cole's karma, a touchpad mapping and battery display |
 | 🧪 | **Cheat mods** | Infinite XP, Max Karma (Hero or Infamous) and Unlock All Powers, as launcher mods you switch on and off |
 | ⚙️ | **Benchmarked defaults** | CPU-core placement, resolution and draw distance tuned with scripted, repeatable benchmark runs |
@@ -124,7 +126,7 @@ cd .. && launcher\build.cmd
 | Page | What's there |
 |---|---|
 | **Home** | Big Play button, quick settings (display mode, resolution, frame cap, VSync), one-click graphics presets, and the status of the build, saves, trophies and play time |
-| **Display** | The same settings as the in-game F10 menu: changing them in either place updates the other. It also suggests the resolution matching your monitor |
+| **Display** | The same settings as the in-game F10 menu: changing them in either place updates the other. It also suggests the resolution matching your monitor, and sets the game language |
 | **Graphics** | Presets (Potato PC, PS3 Original → Ultra), shadows, anisotropic filtering, NVIDIA DLSS (DLAA, Quality, Balanced, Performance) with the DLSS model, AMD FSR with its mode and sharpening, FSR frame generation (and a one-click FSR setup on Radeon cards), DLSS 5 Neural Rendering, and draw distance for the city, objects and vehicles |
 | **ReShade** | Looks and effect sliders for ReShade, which Play installs beside the game (see below) |
 | **Performance** | Frame cap, adaptive draw distance (drops detail below a target frame rate and restores it above), Low-end CPU mode, CPU core placement for hybrid Intel CPUs, process priority |
@@ -253,6 +255,18 @@ On the full 24-core CPU at High settings the mode cost about 2 % of the average:
 
 > [!NOTE]
 > This was simulated by pinning the game to four E-cores, not measured on a real low-end PC. A weak graphics card wasn't tested; at the Potato preset's 720p the GPU sat at about 13 % on the test PC.
+
+## Languages
+
+inFamous has no language menu: it follows the PS3's system language, and the port used to report English and offer only English, French and Spanish. **Display › Language** now gives you every language on the disc:
+
+| Voices, text and subtitles | Text and subtitles, English voices |
+|---|---|
+| English, English (UK), French, German, Italian, Spanish, Dutch, Polish, Portuguese, Russian | Korean, Chinese |
+
+- **Tested:** every one was run in game and loaded its own dialogue and HUD text.
+- **Saves:** one set of saves works in every language.
+- **How it works:** see [launcher/dlss/README.md](launcher/dlss/README.md#game-language). The game chooses its languages from the release it thinks it is; the patch lets it use the European ones without changing the save folder.
 
 ## Controllers
 

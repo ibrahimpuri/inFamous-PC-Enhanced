@@ -75,6 +75,15 @@ The **Controller** page lists every connected controller with its type, connecti
 
 SDL3 (3.4.18, zlib licence) sits in `sdl3\` next to the game. The game loads `SDL3.dll` from there when it starts; without it, only XInput controllers work. After an update or repair, the controller support is put back with the other patches (see the DLSS section).
 
+## Language
+
+inFamous has no language menu of its own. **Display › Language** picks the voices, text and subtitles:
+- **Full voice, text and subtitles:** English, English (UK), French, German, Italian, Spanish, Dutch, Polish, Portuguese and Russian.
+- **Text and subtitles only:** Korean and Chinese. The disc has no voices in them, so those stay English.
+- **Saves:** one set of saves works in every language.
+
+It sets `PS3_LANG` for the game. Before this, the port only offered English, French and Spanish. The patch behind it is put back with the others after an update (see [launcher/dlss/README.md](dlss/README.md#game-language) for how it works).
+
 ## NVIDIA DLSS, AMD FSR and frame generation
 
 The Graphics page has an **NVIDIA DLSS** switch, a **DLSS mode** and a **DLSS model** choice. L and M are the DLSS 4.5

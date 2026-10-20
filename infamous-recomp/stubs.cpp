@@ -631,3 +631,6 @@ extern "C" int infamous_anim_lod_skip(ppu_context* ctx)
 
 /* Gameplay cheats for the launcher's mods: CHEAT_XP / CHEAT_KARMA / CHEAT_ALL_POWERS (inert unless set; see the header) */
 #include "infamous_cheats.h"
+/* The game language for the launcher's Language setting: PS3_LANG (inert unless it names a language the US release
+ * lacks; see the header) */
+#include "infamous_lang.h"

@@ -282,7 +282,13 @@ namespace InfamousLauncher
             group = "Interface";
             Choice(Store.Ini, "KBM_GLYPHS", "Button prompts", "Which button icons the game shows. Automatic follows the device you used last.", "1",
                    new Opt("1", "Automatic"), new Opt("0", "Controller"), new Opt("2", "Keyboard & mouse"));
-
+            group = "Language";
+            Choice(Store.Env, "PS3_LANG", "Language", "Spoken dialogue, subtitles and on-screen text. inFamous has no language menu of its own: it follows the PS3's system language, which this sets. Korean and Chinese are text and subtitles only: the disc has no voices in them, so those stay English. Your saves work in every language.", null,
+                   new Opt(null, "English"), new Opt("british", "English (UK)"), new Opt("french", "Français · French"),
+                   new Opt("german", "Deutsch · German"), new Opt("italian", "Italiano · Italian"), new Opt("spanish", "Español · Spanish"),
+                   new Opt("dutch", "Nederlands · Dutch"), new Opt("polish", "Polski · Polish"), new Opt("portuguese", "Português · Portuguese"),
+                   new Opt("russian", "Русский · Russian"), new Opt("korean", "한국어 · Korean (English voices)"),
+                   new Opt("chinese_s", "中文 · Chinese (English voices)"));
             // ---------------- Graphics ----------------
             page = "graphics"; group = "Quality";
             Toggle(Store.Ini, "SHADOWS", "Shadows", "Sun and character shadows.", "1");
@@ -865,6 +871,8 @@ namespace InfamousLauncher
                 gone.Add("PlayStation / Steam controllers");
             if (!has(Path.Combine(m.Port, "stubs.cpp"), "infamous_cheats"))
                 gone.Add("the cheat mods");
+            if (!has(Path.Combine(ps3, "libs", "system", "cellSysutil.c"), "g_sysutil_lang_hook") || !has(Path.Combine(m.Port, "stubs.cpp"), "infamous_lang"))
+                gone.Add("the game language");
             return gone;
         }
     }

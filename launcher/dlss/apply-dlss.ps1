@@ -1,15 +1,15 @@
 # Puts the launcher's port patches back after "Update inFamous" replaced the game's source, then rebuilds the game:
-# NVIDIA DLSS (DLAA), the gameplay cheats behind the launcher's mods (Infinite XP, Max Karma, Unlock All Powers) and
-# the PlayStation / Steam controller support (SDL3). Start it with apply-dlss.cmd in this folder. Running it again is
-# harmless: a hook that is already there is left alone.
+# NVIDIA DLSS (DLAA) / AMD FSR, the gameplay cheats behind the launcher's mods (Infinite XP, Max Karma, Unlock All
+# Powers), the PlayStation / Steam controller support (SDL3) and the game language (PS3_LANG). Start it with
+# apply-dlss.cmd in this folder. Running it again is harmless: a hook that is already there is left alone.
 #
 # What it does:
 #   1. checks the DLSS SDK files are in <game>\dlss-sdk (SDL3 in <game>\sdl3 is optional: without it the game is
 #      built with XInput controllers only),
 #   2. copies src\rsx_dlss.cpp + rsx_dlss.h into ps3recomp\libs\video, src\pad_sdl3.c + pad_sdl3.h into
-#      ps3recomp\libs\input and src\infamous_cheats.h into infamous-recomp,
+#      ps3recomp\libs\input and src\infamous_cheats.h + infamous_lang.h into infamous-recomp,
 #   3. adds the hooks to ps3recomp\libs\video\rsx_d3d12_backend.c, ps3recomp\libs\input\cellPad.c,
-#      ps3recomp\CMakeLists.txt and infamous-recomp\stubs.cpp. Each hook goes next to a line that must appear exactly
+#      ps3recomp\libs\system\cellSysutil.c, ps3recomp\CMakeLists.txt and infamous-recomp\stubs.cpp. Each hook goes next to a line that must appear exactly
 #      once; if an update changed one of those lines, nothing is written,
 #   4. rebuilds the game (Visual Studio Build Tools + the existing build folder). If the build fails, the patched
 #      files are put back as they were, so the next update applies cleanly.
@@ -32,6 +32,7 @@ $input_  = Join-Path $Ps3recomp 'libs\input'
 $cellpad = Join-Path $input_ 'cellPad.c'
 if (-not $Port) { $Port = Join-Path $root 'infamous-recomp' }
 $stubs   = Join-Path $Port 'stubs.cpp'
+$sysutil = Join-Path $Ps3recomp 'libs\system\cellSysutil.c'
 $latin1  = [Text.Encoding]::GetEncoding(28591)   # byte-exact round trip whatever the files' encoding
 
 function Fail([string]$m) { Write-Host ''; Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
@@ -264,6 +265,12 @@ Hunk stubs after '#include "car_v233.h"' @'
 #include "infamous_cheats.h"
 '@
 
+Hunk stubs after '#include "infamous_cheats.h"' @'
+/* The game language for the launcher's Language setting: PS3_LANG (inert unless it names a language the US release
+ * lacks; see the header) */
+#include "infamous_lang.h"
+'@
+
 Hunk cellpad after '#include "../../runtime/ppu/ppu_memory.h"' @'
 #ifdef PS3RECOMP_SDL3
 #include "pad_sdl3.h"           /* PlayStation / Steam controllers through SDL3 (pad_sdl3.c) */
@@ -349,6 +356,42 @@ endif()
 
 '@
 
+# The game language (the launcher's Display page): the PS3 system language from PS3_LANG instead of always English
+Hunk sysutil before '/* value_ea is a GUEST address, and it is spelt as one.' @'
+/* inFamous launcher: the PS3 system language the game reads -- PS3_LANG, a name (english, british, french, german,
+ * spanish, italian, dutch, polish, portuguese, russian, ...) or the CELL_SYSUTIL_LANG_ number; default English (US).
+ * inFamous has no language menu: its spoken dialogue, text and subtitles follow this. The title's hook (inFamous:
+ * infamous_lang.h) runs when the game reads it. */
+__declspec(selectany) void (*g_sysutil_lang_hook)(int) = NULL;
+static int sysutil_lang_eq(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) { char x = *a, y = *b; if (x >= 'A' && x <= 'Z') x += 32; if (y >= 'A' && y <= 'Z') y += 32; if (x != y) return 0; }
+    return *a == *b;
+}
+static s32 sysutil_lang_from_env(void)
+{
+    static s32 lang = -1;
+    if (lang >= 0) return lang;
+    static const struct { const char* n; s32 v; } k[] = {
+        { "japanese", 0 }, { "english", 1 }, { "english_us", 1 }, { "french", 2 }, { "spanish", 3 }, { "german", 4 },
+        { "italian", 5 }, { "dutch", 6 }, { "portuguese", 7 }, { "portuguese_pt", 7 }, { "russian", 8 }, { "korean", 9 },
+        { "chinese_t", 10 }, { "chinese_s", 11 }, { "finnish", 12 }, { "swedish", 13 }, { "danish", 14 }, { "norwegian", 15 },
+        { "polish", 16 }, { "portuguese_br", 17 }, { "english_gb", 18 }, { "british", 18 }, { "turkish", 19 } };
+    lang = CELL_SYSUTIL_LANG_ENGLISH_US;
+    const char* e = getenv("PS3_LANG");
+    if (e && *e) {
+        char* end = NULL;
+        const long n = strtol(e, &end, 10);
+        if (end && end != e && !*end && n >= 0 && n <= 19) lang = (s32)n;
+        else for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) if (sysutil_lang_eq(e, k[i].n)) { lang = k[i].v; break; }
+    }
+    printf("[cellSysutil] system language %d (PS3_LANG=%s)\n", (int)lang, (e && *e) ? e : "not set");
+    return lang;
+}
+
+'@
+Hunk sysutil replace 'v = CELL_SYSUTIL_LANG_ENGLISH_US;' 'v = sysutil_lang_from_env(); if (g_sysutil_lang_hook) g_sysutil_lang_hook((int)v);   /* inFamous launcher: PS3_LANG */'
+
 # ---------------------------------------------------------------- patching
 # Returns the patched text, or $null when every hook for the file is already there. Throws when an anchor line of a
 # missing hook is missing or appears more than once.
@@ -376,7 +419,7 @@ function Patch([string]$path, [string]$which) {
     return ($lines -join $nl)
 }
 
-Write-Host 'inFamous: re-applying the launcher''s port patches (NVIDIA DLSS, gameplay cheats, PlayStation / Steam controllers)'
+Write-Host 'inFamous: re-applying the launcher''s port patches (DLSS / FSR, gameplay cheats, PlayStation / Steam controllers, game language)'
 # NVIDIA DLSS needs the DLSS SDK in <game>\dlss-sdk, AMD FSR the AMD FSR SDK files in <game>\fsr-sdk; one is enough.
 $hasNgx = @('include\nvsdk_ngx.h', 'lib\Windows_x86_64\x64\nvsdk_ngx_d.lib', 'lib\Windows_x86_64\rel\nvngx_dlss.dll') |
           ForEach-Object { Test-Path (Join-Path $sdk $_) } | Where-Object { -not $_ } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
@@ -388,21 +431,21 @@ if (-not $hasNgx -and -not $hasFfx) {
 }
 if (-not $hasNgx) { Write-Host "  note: no DLSS SDK in $sdk -- the game is built without NVIDIA DLSS" -ForegroundColor Yellow }
 if (-not $hasFfx) { Write-Host "  note: no AMD FSR SDK in $fsr -- the game is built without AMD FSR" -ForegroundColor Yellow }
-foreach ($f in $backend, $cellpad, $cmake, $stubs) { if (-not (Test-Path $f)) { Fail "$f not found." } }
+foreach ($f in $backend, $cellpad, $cmake, $stubs, $sysutil) { if (-not (Test-Path $f)) { Fail "$f not found." } }
 if (-not (Test-Path (Join-Path $root 'sdl3\include\SDL3\SDL_gamepad.h'))) {
     Write-Host '  note: no SDL3 in <game>\sdl3 -- the game is built with Xbox (XInput) controllers only' -ForegroundColor Yellow
 }
 
 $patched = @()
 try {
-    foreach ($t in @(@($backend, 'backend'), @($cellpad, 'cellpad'), @($cmake, 'cmake'), @($stubs, 'stubs'))) {
+    foreach ($t in @(@($backend, 'backend'), @($cellpad, 'cellpad'), @($cmake, 'cmake'), @($stubs, 'stubs'), @($sysutil, 'sysutil'))) {
         $new = Patch $t[0] $t[1]
         if ($new -ne $null) { $patched += ,@($t[0], $new) }
     }
 }
 catch { Fail $_.Exception.Message }
 
-foreach ($c in @(@('rsx_dlss.cpp', $video), @('rsx_dlss.h', $video), @('pad_sdl3.c', $input_), @('pad_sdl3.h', $input_), @('infamous_cheats.h', $Port))) {
+foreach ($c in @(@('rsx_dlss.cpp', $video), @('rsx_dlss.h', $video), @('pad_sdl3.c', $input_), @('pad_sdl3.h', $input_), @('infamous_cheats.h', $Port), @('infamous_lang.h', $Port))) {
     $s = Join-Path $here "src\$($c[0])"; $d = Join-Path $c[1] $c[0]
     if (-not (Test-Path $d) -or (Get-FileHash $s).Hash -ne (Get-FileHash $d).Hash) { Copy-Item -LiteralPath $s -Destination $d -Force; Write-Host "  copied $($c[0])" }
 }
@@ -458,5 +501,5 @@ if ($p.ExitCode -ne 0 -or -not $obj) {
     Fail "the build failed (full log: $log). The game source was put back as it was. $state"
 }
 Write-Host ''
-Write-Host 'DLSS, the cheat mods and PlayStation / Steam controller support are back in the game.' -ForegroundColor Green
+Write-Host 'DLSS / FSR, the cheat mods, PlayStation / Steam controller support and the game language are back in the game.' -ForegroundColor Green
 exit 0

@@ -197,7 +197,7 @@ namespace InfamousLauncher
         // ------------------------------------------------------------------------------------------------
         UIElement DisplayPage()
         {
-            return SettingsPage("display", "Display", "These are the same settings as the in-game menu (F10); changing them in either place updates the other.", DisplayInfo());
+            return SettingsPage("display", "Display", "Screen and interface are the same settings as the in-game menu (F10); changing them in either place updates the other. Language is set here.", DisplayInfo());
         }
 
         UIElement DisplayInfo()
