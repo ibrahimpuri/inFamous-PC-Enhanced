@@ -38,6 +38,7 @@ namespace InfamousLauncher
             {
                 case "display": return "Display";
                 case "graphics": return "Graphics";
+                case "reshade": return "ReShade";
                 case "performance": return "Performance";
                 case "input": return "Controls";
                 case "controller": return "Controller";
@@ -46,11 +47,15 @@ namespace InfamousLauncher
             }
         }
 
-        bool Cond(string expr)
+        bool Cond(string expr)   // KEY=value, several joined with &
         {
             if (string.IsNullOrEmpty(expr)) return true;
-            int eq = expr.IndexOf('=');
-            return Inv.Same(M.Get(expr.Substring(0, eq)), expr.Substring(eq + 1));
+            foreach (var part in expr.Split('&'))
+            {
+                int eq = part.IndexOf('=');
+                if (!Inv.Same(M.Get(part.Substring(0, eq)), part.Substring(eq + 1))) return false;
+            }
+            return true;
         }
 
         void Change(Def d, string v)
@@ -220,6 +225,27 @@ namespace InfamousLauncher
             return Card(g);
         }
 
+        // Performance page: suggests Low-end CPU mode on a CPU with 8 logical processors or fewer.
+        UIElement LowCpuNote()
+        {
+            int n = Environment.ProcessorCount;
+            if (n > 8 || M.Cfg.LowCpu == "1") return null;
+            var g = new Grid { Margin = new Thickness(18, 14, 18, 14) };
+            g.ColumnDefinitions.Add(new ColumnDefinition());
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var text = VStack(T("This PC has " + n + " logical processors", 14, "Text", FontWeights.SemiBold),
+                              T("The shipped settings are tuned for bigger CPUs and can make the game stall on this one. Low-end CPU mode " +
+                                "(also part of the Potato PC preset on the Graphics page) stops the threads from spin-waiting and reserving cores.", 12.5, "Dim"));
+            text.Margin = new Thickness(0, 0, 14, 0);
+            g.Children.Add(text);
+            var b = Btn("Turn on Low-end CPU mode", () => { M.Set(Catalog.Find("launcher.lowcpu"), "1"); QueueSave(); RebuildPage(); }, "Primary", "");
+            b.Margin = new Thickness(0);
+            b.VerticalAlignment = VerticalAlignment.Center;
+            Grid.SetColumn(b, 1);
+            g.Children.Add(b);
+            return Card(g);
+        }
+
         UIElement GraphicsPage()
         {
             return SettingsPage("graphics", "Graphics", "Image quality and how far the city is drawn. Draw distance has the biggest effect on frame rate.", PresetSection());
@@ -245,8 +271,13 @@ namespace InfamousLauncher
 
         UIElement PresetSection()
         {
-            var wrap = new UniformGrid { Columns = Catalog.Presets.Length, Margin = new Thickness(20, 4, 10, 10) };
-            foreach (var p in Catalog.Presets)
+            return PresetSection(Catalog.Presets, "Presets", "Sets resolution, texture filtering, shadows and draw distance in one go. Potato PC also lowers CPU work for low-end PCs. Fine-tune anything below afterwards.");
+        }
+
+        UIElement PresetSection(Catalog.Preset[] list, string title, string subtitle)
+        {
+            var wrap = new UniformGrid { Columns = list.Length, Margin = new Thickness(20, 4, 10, 10) };
+            foreach (var p in list)
             {
                 bool on = PresetActive(p);
                 var body = VStack(new TextBlock { Text = p.Name, FontSize = 14, FontWeight = FontWeights.SemiBold },
@@ -257,7 +288,7 @@ namespace InfamousLauncher
                 b.Click += (s, e) => ApplyPreset(preset);
                 wrap.Children.Add(b);
             }
-            return Section("Presets", "Sets resolution, texture filtering, shadows and draw distance in one go. Fine-tune anything below afterwards.", new UIElement[] { wrap });
+            return Section(title, subtitle, new UIElement[] { wrap });
         }
 
         // ------------------------------------------------------------------------------------------------

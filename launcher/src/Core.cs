@@ -129,10 +129,12 @@ namespace InfamousLauncher
         public readonly Dictionary<string, string> Env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         public readonly List<string> EnvOrder = new List<string>();   // keys the player added, in order
         public readonly Dictionary<string, bool> Mods = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, string> ReShade = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // [reshade]: the ReShade page
         public string Priority = "normal";     // normal | above | high
         public string AfterLaunch = "stay";    // stay | minimize | close
         public string Exe = "";                // game executable override, relative to the root or absolute
         public string Dlss5 = "0";             // 1 = install OptiScaler (launcher\dlss5) for DLSS 5 Neural Rendering
+        public string LowCpu = "0";            // 1 = Low-end CPU mode (Catalog.LowCpuEnv)
         public string LastPage = "home";
         public string LastPlayed = "";
         public long PlaySeconds;
@@ -152,6 +154,7 @@ namespace InfamousLauncher
                 string k = line.Substring(0, eq).Trim(), v = line.Substring(eq + 1).Trim();
                 if (sec == "env") { c.Env[k] = v; c.EnvOrder.Add(k); }
                 else if (sec == "mods") c.Mods[k] = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
+                else if (sec == "reshade") c.ReShade[k] = v;
                 else if (sec == "launcher")
                 {
                     switch (k.ToLowerInvariant())
@@ -160,6 +163,7 @@ namespace InfamousLauncher
                         case "after_launch": c.AfterLaunch = v; break;
                         case "exe": c.Exe = v; break;
                         case "dlss5": c.Dlss5 = v; break;
+                        case "low_cpu": c.LowCpu = v; break;
                         case "last_page": c.LastPage = v; break;
                         case "last_played": c.LastPlayed = v; break;
                         case "play_seconds": long.TryParse(v, out c.PlaySeconds); break;
@@ -181,9 +185,13 @@ namespace InfamousLauncher
             sb.AppendLine("after_launch=" + AfterLaunch);
             sb.AppendLine("exe=" + Exe);
             sb.AppendLine("dlss5=" + Dlss5);
+            sb.AppendLine("low_cpu=" + LowCpu);
             sb.AppendLine("last_page=" + LastPage);
             sb.AppendLine("last_played=" + LastPlayed);
             sb.AppendLine("play_seconds=" + PlaySeconds.ToString(Inv.C));
+            sb.AppendLine();
+            sb.AppendLine("[reshade]");
+            foreach (var k in ReShade.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) sb.AppendLine(k + "=" + ReShade[k]);
             sb.AppendLine();
             sb.AppendLine("[env]");
             foreach (var k in Env.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) sb.AppendLine(k + "=" + Env[k]);
@@ -246,10 +254,18 @@ namespace InfamousLauncher
             return Add(new Def { Store = Store.Env, Key = key, Label = label, Desc = desc, Kind = Kind.Slider, Fallback = fallback,
                                  Min = min, Max = max, Step = step, Fmt = fmt });
         }
+        static Def LSlider(string key, string label, string desc, string fallback, double min, double max, double step, Func<double, string> fmt)
+        {
+            var d = Slider(key, label, desc, fallback, min, max, step, fmt);
+            d.Store = Store.Launcher;
+            return d;
+        }
         static Func<double, string> Times(string one)
         {
             return x => Math.Abs(x - 1) < 1e-6 && one != null ? "1× (" + one + ")" : x.ToString("0.##", Inv.C) + "×";
         }
+        static string Pct(double x) { return Math.Abs(x) < 1e-6 ? "Off" : (x * 100).ToString("0", Inv.C) + " %"; }
+        static string Signed(double x) { return Math.Abs(x) < 1e-6 ? "0 (as the game)" : (x > 0 ? "+" : "−") + Math.Abs(x * 100).ToString("0", Inv.C); }
 
         static Catalog()
         {
@@ -289,15 +305,41 @@ namespace InfamousLauncher
             nr.EnabledIf = "DLSS=1";
             nr.Experimental = true;
             group = "World detail";
-            Slider("LOD_CLASS_SCALE", "Draw distance", "Scales the city's level-of-detail switch distances: buildings, props and people keep their detail and appear farther away. Costs CPU and GPU time. F5 toggles it in game to compare.",
-                   "1", 1, 4, 0.25, Times("PS3"));
+            Slider("LOD_CLASS_SCALE", "Draw distance", "Scales the city's level-of-detail switch distances: buildings, props and people keep their detail and appear farther away. Costs CPU and GPU time. Below 1× objects simplify and fade sooner than on the PS3, which helps slow PCs. F5 toggles it in game to compare.",
+                   "1", 0.5, 4, 0.25, Times("PS3"));
             Slider("LOD_DIST_SCALE", "Object fade distance", "Pushes out the distance where individual objects fade between detail levels.",
                    "2", 1, 4, 0.25, Times("off"));
-            var car = Slider("CAR_DIST_SCALE", "Vehicle draw distance", "Traffic and parked cars are drawn, and switch detail, this many times farther away, so fewer cars pop in.",
-                   "1", 1, 4, 0.25, Times("PS3"));
+            var car = Slider("CAR_DIST_SCALE", "Vehicle draw distance", "Traffic and parked cars are drawn, and switch detail, this many times farther away, so fewer cars pop in. Below 1× fewer distant cars are drawn.",
+                   "1", 0.5, 4, 0.25, Times("PS3"));
             car.Experimental = true;
             var anim = Toggle(Store.Env, "ANIM_LOD", "Distant animation LOD", "Skips small animation jobs for far-away characters for about +1 FPS in the city. Cole is never affected. Off in the shipped profile.", "0");
             anim.Experimental = true;
+
+            // ---------------- ReShade (launcher\reshade, applied at Play by ReShadeSetup) ----------------
+            // The fallbacks are the Remastered look.
+            page = "reshade"; group = "In the game";
+            Toggle(Store.Launcher, "reshade.on", "ReShade", "Post-processing on the finished image: sharper texture detail, contact shadows, less haze and richer colour. Costs a little GPU time; leave it off on a weak graphics card. Applied when you press Play.", "0");
+            var src = Choice(Store.Launcher, "reshade.source", "Effects", "The look set on this page, or a preset you build yourself in ReShade's overlay (Home key in game) from any shaders in launcher\\reshade\\shaders.", "launcher",
+                   new Opt("launcher", "This page's look"), new Opt("own", "My own ReShade preset"));
+            src.EnabledIf = "reshade.on=1";
+            const string mine = "reshade.on=1&reshade.source=launcher";
+            group = "Detail";
+            LSlider("reshade.sharpen", "Sharpening", "Contrast-adaptive sharpening: crisper textures and edges without halos.", "0.4", 0, 1, 0.05, Pct).EnabledIf = mine;
+            LSlider("reshade.clarity", "Clarity", "Local contrast: brick, concrete and cloth detail stand out more, overall contrast stays the same.", "0.3", 0, 1, 0.05, Pct).EnabledIf = mine;
+            LSlider("reshade.ao", "Ambient occlusion", "Soft contact shadows where surfaces meet: corners, ledges, under objects. Uses the game's depth; the most expensive effect here.", "0.5", 0, 1, 0.05, Pct).EnabledIf = mine;
+            Toggle(Store.Launcher, "reshade.deband", "Deband", "Smooths the colour banding in the sky, fog and smoke.", "1").EnabledIf = mine;
+            group = "Colour";
+            LSlider("reshade.dehaze", "Haze removal", "Pulls down the washed-out black level of the game's haze.", "0.3", 0, 1, 0.05, Pct).EnabledIf = mine;
+            LSlider("reshade.contrast", "Contrast", null, "0.15", -0.5, 1, 0.05, Signed).EnabledIf = mine;
+            LSlider("reshade.vibrance", "Vibrance", "Saturates dull colours more than vivid ones, so skin tones stay natural.", "0.25", -1, 1, 0.05, Signed).EnabledIf = mine;
+            LSlider("reshade.saturation", "Saturation", null, "1", 0, 2, 0.05, x => (x * 100).ToString("0", Inv.C) + " %").EnabledIf = mine;
+            LSlider("reshade.exposure", "Exposure", null, "0", -1, 1, 0.05, Signed).EnabledIf = mine;
+            LSlider("reshade.shadows", "Shadows", "Lifts (+) or deepens (−) the dark tones.", "0", -1, 1, 0.05, Signed).EnabledIf = mine;
+            LSlider("reshade.highlights", "Highlights", "Brightens (+) or recovers (−) the bright tones.", "-0.1", -1, 1, 0.05, Signed).EnabledIf = mine;
+            LSlider("reshade.warmth", "Warmth", "Cooler (−) or warmer (+). inFamous is graded quite yellow.", "-0.1", -1, 1, 0.05, Signed).EnabledIf = mine;
+            LSlider("reshade.tint", "Tint", "Magenta (−) or green (+).", "0", -1, 1, 0.05, Signed).EnabledIf = mine;
+            group = "Lens";
+            LSlider("reshade.vignette", "Vignette", "Darkens the edges of the picture.", "0", 0, 1, 0.05, Pct).EnabledIf = mine;
 
             // ---------------- Performance ----------------
             page = "performance"; group = "Frame rate";
@@ -310,12 +352,14 @@ namespace InfamousLauncher
             var mn = Slider("ADAPT_LOD_MIN", "Lowest draw distance", "How far down the adaptive mode may go.", "1", 1, 3, 0.25, Times("PS3"));
             lo.EnabledIf = hi.EnabledIf = mn.EnabledIf = "ADAPT_LOD=1";
             group = "CPU";
+            Toggle(Store.Launcher, "launcher.lowcpu", "Low-end CPU mode", "For CPUs with 4 cores / 8 threads or fewer. The shipped profile is tuned for big CPUs: its SPU threads spin-wait and it reserves cores, and on a small CPU those threads starve each other until the game stalls. This mode stops the spinning and the core reservations. On a 4-core CPU it takes the game from stalling to about 49 FPS; on a big CPU it costs about 2 %. The Potato PC preset turns it on.", "0");
             Toggle(Store.Env, "PS3_PCORE", "Prefer performance cores", "On Intel hybrid CPUs, keeps the busy emulation threads on P-cores instead of E-cores. No effect on other CPUs.", "1");
-            Toggle(Store.Env, "PS3_MAIN_CORE", "Reserve a core for the main thread", "Gives the game's main PPU thread a physical core of its own (+0.7 FPS in the port's benchmarks).", "1");
+            var mainCore = Toggle(Store.Env, "PS3_MAIN_CORE", "Reserve a core for the main thread", "Gives the game's main PPU thread a physical core of its own (+0.7 FPS in the port's benchmarks).", "1");
             var fifo = Toggle(Store.Env, "PS3_FIFO_CORE", "Reserve a core for the GPU command thread", "Gives the RSX FIFO thread its own physical core (+1.9 to +2.6 FPS in the port's benchmarks).", "0");
             fifo.Warn = "On CPUs with 4 cores or fewer, reserving cores can make things slower.";
-            Toggle(Store.Env, "PS3_AUDIO_CORE", "Reserve a core for the audio mixer", "Keeps the SPU audio mixer on its own core so music and effects don't stutter under load.", "1");
+            var audioCore = Toggle(Store.Env, "PS3_AUDIO_CORE", "Reserve a core for the audio mixer", "Keeps the SPU audio mixer on its own core so music and effects don't stutter under load.", "1");
             Toggle(Store.Env, "PS3_FAST_HOST", "Boost render threads", "Runs the RSX, FIFO and render threads at above-normal priority.", null, null, "1");
+            mainCore.EnabledIf = fifo.EnabledIf = audioCore.EnabledIf = "launcher.lowcpu=0";   // Low-end CPU mode turns them off
             group = "Process";
             Choice(Store.Launcher, "launcher.priority", "Process priority", "Windows priority class for the game. High can make the rest of the PC sluggish while you play.", "normal",
                    new Opt("normal", "Normal"), new Opt("above", "Above normal"), new Opt("high", "High"));
@@ -374,6 +418,11 @@ namespace InfamousLauncher
         }
         public static readonly Preset[] Presets =
         {
+            // Low-end PCs: the game is CPU-bound, so this mostly cuts CPU work (shorter draw distances, fewer distant
+            // cars, simplified far animation, 30 FPS) and keeps the GPU at the PS3's 720p with no extras.
+            new Preset("Potato PC", "720p · 30 FPS · shortest draw distance, for low-end PCs",
+                       "RES_SCALE=1", "TEX_ANISO=-1", "TEX_MIPS=1", "SHADOWS=0", "LOD_CLASS_SCALE=0.75", "LOD_DIST_SCALE=1", "CAR_DIST_SCALE=0.75",
+                       "UI_FPS_CAP=30", "ADAPT_LOD=0", "ANIM_LOD=1", "DLSS=0", "reshade.on=0", "launcher.lowcpu=1", "AUDIO_AHEAD_BLOCKS=24", "AUDIO_STRETCH=1"),
             new Preset("PS3 Original", "720p · 30 FPS · original draw distance",
                        "RES_SCALE=1", "TEX_ANISO=-1", "TEX_MIPS=1", "SHADOWS=1", "LOD_CLASS_SCALE=1", "LOD_DIST_SCALE=1", "CAR_DIST_SCALE=1", "UI_FPS_CAP=30", "ADAPT_LOD=0"),
             new Preset("Performance", "720p · no shadows · original draw distance",
@@ -384,6 +433,45 @@ namespace InfamousLauncher
                        "RES_SCALE=2", "TEX_ANISO=16", "TEX_MIPS=1", "SHADOWS=1", "LOD_CLASS_SCALE=1.5", "LOD_DIST_SCALE=1", "ADAPT_LOD=1"),
             new Preset("Ultra", "4K · 16× AF · 2.5× draw distance",
                        "RES_SCALE=3", "TEX_ANISO=16", "TEX_MIPS=1", "SHADOWS=1", "LOD_CLASS_SCALE=2.5", "LOD_DIST_SCALE=1.5", "ADAPT_LOD=1"),
+        };
+
+        // Low-end CPU mode: what it changes on top of installer\launch.txt. On four cores the shipped profile livelocks:
+        // while the PPU waits on a workload, its lane threads stay hot (spin) and so does the PPU, and the kernel thread
+        // that would start the next pass never gets a core (no world after 8 min on 4 E-cores). Here:
+        //  - runtime ABX bit 0x04 ("lanes / kernels stay hot while the PPU waits") is cleared: 0x83F -> 0x83B. It can
+        //    only be set through the A/B machinery, so that is given one fixed value (no cycling, phase 0 throughout);
+        //  - the SPU kernel, lane pool and event-flag threads stop spin-waiting, hot-poll lanes and the always-hot
+        //    audio kernel are off, no cores are reserved, light workloads run their lanes serially (V222T).
+        // 4 E-cores, Potato graphics, uncapped: 48.9 FPS, 1 % low 32.6. All 24 cores, High: 90.5 vs 92.3 FPS shipped,
+        // 1 % low 48.9 vs 41.8.
+        public static readonly string[] LowCpuEnv =
+        {
+            "PS3_AB=1", "PS3_AB_SEC=3600", "PS3_AB_SEQ=0,0", "PS3_ABX_SEQ=0x83B,0x83B",
+            "SPURS_LANE_SPIN_US=0", "SPURS_SPIN_US=0", "SPURS_EF_SPIN_US=0", "SPURS_HOT_WIDS=-", "SPURS_INST1_HOT=0", "SPURS_INST1_NAP=1",
+            "PS3_MAIN_CORE=0", "PS3_FIFO_CORE=0", "PS3_AUDIO_CORE=0", "V222T=1",
+        };
+
+        // ReShade page looks (they also switch ReShade on, with this page's effects)
+        static string[] Look(double sharpen, double clarity, double ao, double dehaze, double contrast, double vibrance, double saturation,
+                             double exposure, double shadows, double highlights, double warmth, double vignette)
+        {
+            Func<double, string> n = x => Inv.Num(x);
+            return new[] { "reshade.on=1", "reshade.source=launcher", "reshade.deband=1", "reshade.tint=0",
+                           "reshade.sharpen=" + n(sharpen), "reshade.clarity=" + n(clarity), "reshade.ao=" + n(ao), "reshade.dehaze=" + n(dehaze),
+                           "reshade.contrast=" + n(contrast), "reshade.vibrance=" + n(vibrance), "reshade.saturation=" + n(saturation),
+                           "reshade.exposure=" + n(exposure), "reshade.shadows=" + n(shadows), "reshade.highlights=" + n(highlights),
+                           "reshade.warmth=" + n(warmth), "reshade.vignette=" + n(vignette) };
+        }
+        public static readonly Preset[] Looks =
+        {
+            new Preset("Natural", "Crisper and cleaner, colours as the game made them",
+                       Look(0.35, 0.15, 0.35, 0.15, 0.05, 0.1, 1, 0, 0, 0, 0, 0)),
+            new Preset("Remastered", "Sharper detail, contact shadows, less haze, richer colour",
+                       Look(0.4, 0.3, 0.5, 0.3, 0.15, 0.25, 1, 0, 0, -0.1, -0.1, 0)),
+            new Preset("Vivid", "Punchy colour and contrast, strong detail",
+                       Look(0.5, 0.45, 0.6, 0.45, 0.25, 0.5, 1.1, 0, 0.1, -0.15, 0, 0)),
+            new Preset("Cinematic", "Moody film look: deep shadows, warm grade, vignette",
+                       Look(0.3, 0.25, 0.6, 0.35, 0.3, 0.1, 0.85, -0.05, -0.15, -0.25, 0.15, 0.4)),
         };
     }
 
@@ -569,6 +657,12 @@ namespace InfamousLauncher
                     if (d.Key == "launcher.priority") return Cfg.Priority;
                     if (d.Key == "launcher.after") return Cfg.AfterLaunch;
                     if (d.Key == "launcher.dlss5") return Cfg.Dlss5;
+                    if (d.Key == "launcher.lowcpu") return Cfg.LowCpu;
+                    if (d.Key.StartsWith("reshade.", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string r;
+                        return Cfg.ReShade.TryGetValue(d.Key.Substring(8), out r) ? r : d.Fallback;
+                    }
                     return d.Fallback;
                 case Store.Ini:
                     string v;
@@ -594,6 +688,13 @@ namespace InfamousLauncher
                     if (d.Key == "launcher.priority") Cfg.Priority = v;
                     else if (d.Key == "launcher.after") Cfg.AfterLaunch = v;
                     else if (d.Key == "launcher.dlss5") Cfg.Dlss5 = v;
+                    else if (d.Key == "launcher.lowcpu") Cfg.LowCpu = v;
+                    else if (d.Key.StartsWith("reshade.", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Store only real changes, like the environment settings.
+                        if (v == null || Inv.Same(v, d.Fallback)) Cfg.ReShade.Remove(d.Key.Substring(8));
+                        else Cfg.ReShade[d.Key.Substring(8)] = v;
+                    }
                     break;
                 case Store.Ini:
                     Ini[d.Key] = v;
@@ -703,6 +804,8 @@ namespace InfamousLauncher
             var env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (DictionaryEntry e in Environment.GetEnvironmentVariables()) env[(string)e.Key] = (string)e.Value;
             foreach (var kv in Spec.Env) env[kv.Key] = kv.Value;
+            if (Cfg.LowCpu == "1")   // Low-end CPU mode; the player's own overrides below still win
+                foreach (var kv in Catalog.LowCpuEnv) { int eq = kv.IndexOf('='); env[kv.Substring(0, eq)] = kv.Substring(eq + 1); }
             foreach (var kv in Cfg.Env)
                 if (kv.Value == LauncherConfig.Unset) env.Remove(kv.Key); else env[kv.Key] = kv.Value;
             foreach (var m in EnabledMods)
@@ -726,9 +829,9 @@ namespace InfamousLauncher
         public const string ModelDll = "nvngx_dlssnr.dll";
         public static string Source(Model m) { return Path.Combine(m.P.LauncherDir, "dlss5"); }
         static string DlssRuntime(Model m) { return Path.Combine(m.P.Root, "dlss-sdk", "lib", "Windows_x86_64", "rel"); }
-        static bool Wanted(Model m) { return m.Cfg.Dlss5 == "1" && Inv.Same(m.Get("DLSS"), "1"); }
+        public static bool Wanted(Model m) { return m.Cfg.Dlss5 == "1" && Inv.Same(m.Get("DLSS"), "1"); }
 
-        static bool IsOpti(string dll)
+        public static bool IsOpti(string dll)
         {
             try
             {
@@ -804,7 +907,7 @@ namespace InfamousLauncher
             return null;
         }
 
-        static void CopyIfChanged(string from, string to)
+        public static void CopyIfChanged(string from, string to)
         {
             var a = new FileInfo(from);
             var b = new FileInfo(to);
@@ -814,7 +917,7 @@ namespace InfamousLauncher
         }
 
         // Sets key=value in [section], keeping everything else in the file (comments, encoding, line endings).
-        static void SetIni(string path, string section, string key, string value)
+        public static void SetIni(string path, string section, string key, string value)
         {
             byte[] raw = File.ReadAllBytes(path);
             bool bom = raw.Length >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF;

@@ -10,6 +10,7 @@ It starts the game exactly like `inFamous.exe` does, from `installer\launch.txt`
 | In-game menu settings (display mode, resolution, VSync, frame rate limit, button prompts, mouse speed, shadows, texture filtering, mipmaps) | `infamous-recomp\settings.ini` | the in-game menu (F10); the game lets this file win over everything else |
 | Every other switch the game reads (draw distance, CPU core use, mouse feel, audio buffer, ...) | `launcher\launcher.ini`, `[env]` section, only the values you changed | nobody |
 | Enabled mods, process priority, chosen build, play time | `launcher\launcher.ini` | nobody |
+| The ReShade page | `launcher\launcher.ini`, `[reshade]` section; at Play also `ReShade.ini` and `ReShade-inFamous-Launcher.ini` beside the game exe | ReShade's overlay (its own settings in `ReShade.ini`) |
 
 `installer\launch.txt` is never modified, so `infamous-installer update` can't overwrite your changes, and
 deleting `launcher\launcher.ini` returns everything to the installer's defaults.
@@ -90,6 +91,50 @@ DLSS is added to the port's renderer by this launcher, not by upstream, so **aft
 **DLSS 5 Neural Rendering** (same page) runs NVIDIA's DLSS 5 model over the DLSS image through OptiScaler-DLSSNR, a
 community mod kept in `dlss5\`. When the switch is on, Play installs it beside the game exe as `dxgi.dll`; when it is
 off, Play removes it again. See the DLSS 5 section of [dlss\README.md](dlss/README.md).
+
+## ReShade
+
+The **ReShade** page adds post-processing on top of the finished picture, with effects written for inFamous:
+- sharpening and clarity, for texture detail;
+- ambient occlusion from the game's depth;
+- debanding;
+- colour: haze removal, contrast, vibrance, white balance;
+- a vignette.
+
+Pick a look (Natural, Remastered, Vivid, Cinematic) and fine-tune the sliders. Or switch **Effects** to *My own
+ReShade preset* and build one in ReShade's overlay from any shader packs in `reshade\shaders`.
+
+- **In game:** Home opens ReShade's overlay; End switches the effects off and on.
+- **Getting ReShade:** download `ReShade_Setup_<version>.exe` from reshade.me and press **Add ReShade…** on the page. Only `ReShade64.dll` is taken out of it; the setup never runs.
+- **How it loads:** Play installs ReShade beside the game exe as `dxgi.dll`. While DLSS 5 is on, OptiScaler owns `dxgi.dll`, so ReShade goes in as `ReShade64.dll` and OptiScaler loads it.
+
+Details: [reshade\README.md](reshade/README.md).
+
+## Potato PC preset and Low-end CPU mode
+
+The first card on the Graphics page, **Potato PC**, is for low-end PCs. The game is CPU-bound, so it mostly cuts CPU
+work:
+- **Graphics:** 720p, 30 FPS cap, shadows off, the game's own texture filtering.
+- **Detail:** 0.75× draw distance, 0.75× vehicle draw distance, distant animation LOD on.
+- **Extras off:** DLSS and ReShade.
+- **Audio:** a larger audio buffer that stretches instead of crackling.
+- **CPU:** it turns on **Low-end CPU mode** (Performance page).
+
+**Low-end CPU mode.** The shipped thread setup is tuned for big CPUs. On a 4-core CPU it livelocks:
+- **What goes wrong:** while the game's main thread waits for SPU work, the worker threads spin-wait instead of sleeping, and so does the main thread. The thread that would hand out the next batch of work never gets a core.
+- **What the mode changes:** spin-waits become sleeps, and core reservations are off. It also clears one runtime scheduling bit (ABX `0x04`, through the port's A/B mechanism, set once).
+- **Your overrides still win:** any of these variables you set yourself on the Advanced page takes priority.
+- **The hint:** on a PC with 8 logical processors or fewer, the Performance page suggests the mode.
+
+**Measured on four E-cores of a Core Ultra 7** (about a budget quad-core), uncapped, 2.5-minute camera pan:
+
+| Setup | Average FPS | 1 % low |
+|---|---|---|
+| Shipped settings | never reached the world (8 min) | |
+| High settings + Low-end CPU mode | 42.6 | 29.0 |
+| **Potato PC** (with Low-end CPU mode) | **48.9** | **32.6** |
+
+So the 30 FPS cap holds with headroom. On the full 24-core CPU, Low-end CPU mode cost about 2 % average FPS: 90.5 against 92.3 at High. In that one run its 1 % lows were better, 48.9 against 41.8.
 
 ## Command line
 

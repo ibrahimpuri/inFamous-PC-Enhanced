@@ -59,6 +59,10 @@ launcher/dlss/backup/
 launcher/dlss/original/
 launcher/dlss/removed-upstream/
 launcher/dlss/build.log*
+# ReShade itself (the player adds it with the ReShade page's "Add ReShade..."); only inFamous.fx and the README are kept
+launcher/reshade/*.dll
+launcher/reshade/*.new
+launcher/reshade/*.exe
 dlss-sdk/
 save-backups/
 github/

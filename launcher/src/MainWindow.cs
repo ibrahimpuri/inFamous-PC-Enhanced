@@ -269,6 +269,7 @@ namespace InfamousLauncher
             NavLabel(navStack, "SETTINGS");
             AddNav(navStack, "display", "", "Display");
             AddNav(navStack, "graphics", "", "Graphics");
+            AddNav(navStack, "reshade", "", "ReShade");
             AddNav(navStack, "performance", "", "Performance");
             AddNav(navStack, "input", "", "Controls");
             AddNav(navStack, "controller", "\uE7FC", "Controller");
@@ -344,7 +345,8 @@ namespace InfamousLauncher
                 case "home": content = HomePage(); break;
                 case "display": content = DisplayPage(); break;
                 case "graphics": content = GraphicsPage(); break;
-                case "performance": content = SettingsPage("performance", "Performance", "Frame rate and CPU settings. The CPU defaults come from the port's benchmarks; if you get stutter on a CPU with few cores, try turning core reservations off."); break;
+                case "reshade": content = ReShadePage(); break;
+                case "performance": content = SettingsPage("performance", "Performance", "Frame rate and CPU settings. The CPU defaults come from the port's benchmarks; on a CPU with few cores, turn on Low-end CPU mode.", LowCpuNote()); break;
                 case "input": content = SettingsPage("input", "Controls", "Keyboard and mouse. Controllers have their own page."); break;
                 case "controller": content = ControllerPage(); break;
                 case "audio": content = SettingsPage("audio", "Audio", null); break;
@@ -417,9 +419,7 @@ namespace InfamousLauncher
                 M.WriteSettingsIni();
                 if (game != null) game.Dispose();
                 weKilled = false;
-                string nr;
-                try { nr = Dlss5.Sync(M); }
-                catch (Exception e) { nr = "DLSS 5 Neural Rendering could not be set up: " + e.Message + "\n\nThe game starts without it."; }
+                string nr = Proxies.Sync(M);   // DLSS 5 (OptiScaler) and ReShade
                 if (nr != null) MessageBox.Show(nr, "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning);
                 game = RunningGame.Start(M.ResolveExe(), M.Spec.Args, M.Spec.Cwd, M.BuildEnvironment(), M.StdoutLog, M.StderrLog, M.Cfg.Priority);
                 M.Cfg.LastPlayed = DateTime.Now.ToString("yyyy-MM-dd HH:mm", Inv.C);
@@ -477,6 +477,8 @@ namespace InfamousLauncher
             string c = M.Get(cap);
             parts.Add(c == "0" ? "uncapped" : Label(cap, c).Replace(" (PS3)", ""));
             if (Inv.Same(M.Get("DLSS"), "1")) { var dm = Catalog.Find("DLSS_MODE"); parts.Add("DLSS " + Label(dm, M.Get(dm)).Split('·')[0].Trim()); }
+            if (M.Cfg.LowCpu == "1") parts.Add("low-end CPU mode");
+            if (ReShadeSetup.Wanted(M)) parts.Add(ReShadeSetup.OwnPreset(M) ? "ReShade" : "ReShade " + ReShadeSetup.LookName(M));
             int mods = M.EnabledMods.Count();
             if (mods > 0) parts.Add(mods + (mods == 1 ? " mod" : " mods"));
             return string.Join(" · ", parts);

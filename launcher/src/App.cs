@@ -68,9 +68,7 @@ namespace InfamousLauncher
             try
             {
                 m.WriteSettingsIni();
-                string nr;
-                try { nr = Dlss5.Sync(m); }
-                catch (Exception e) { nr = "DLSS 5 Neural Rendering could not be set up: " + e.Message + "\n\nThe game starts without it."; }
+                string nr = Proxies.Sync(m);   // DLSS 5 (OptiScaler) and ReShade
                 if (nr != null) MessageBox.Show(nr, "inFamous Launcher", MessageBoxButton.OK, MessageBoxImage.Warning);
                 using (RunningGame.Start(m.ResolveExe(), m.Spec.Args, m.Spec.Cwd, m.BuildEnvironment(), m.StdoutLog, m.StderrLog, m.Cfg.Priority)) { }
                 m.Cfg.LastPlayed = DateTime.Now.ToString("yyyy-MM-dd HH:mm", Inv.C);
@@ -96,6 +94,7 @@ namespace InfamousLauncher
                 sb.AppendLine("stderr=" + m.StderrLog);
                 sb.AppendLine("priority=" + m.Cfg.Priority);
                 sb.AppendLine("dlss5=" + Dlss5.Status(m));
+                sb.AppendLine("reshade=" + ReShadeSetup.Status(m));
                 sb.AppendLine("settings.ini=" + m.SettingsIni);
                 foreach (var k in Catalog.IniKeys) sb.AppendLine("ini " + k + "=" + m.Get(Catalog.Find(k)));
                 foreach (var mod in m.ModList) sb.AppendLine("mod " + mod.Id + " available=" + mod.Available + " enabled=" + m.ModEnabled(mod) + " env=" + string.Join(",", mod.Env.Select(kv => kv.Key + "=" + kv.Value)));
