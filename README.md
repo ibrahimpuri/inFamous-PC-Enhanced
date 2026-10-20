@@ -4,7 +4,7 @@
 
 It adds:
 - a full launcher with every setting in one place;
-- **NVIDIA DLSS (DLAA)**, wired into the port's own Direct3D 12 renderer;
+- **NVIDIA DLSS**: DLAA plus **Quality / Balanced / Performance** upscaling, wired into the port's own Direct3D 12 renderer;
 - optional **DLSS 5 Neural Rendering**;
 - native **DualSense, DualShock 4 and Steam Controller** support;
 - **cheat mods**;
@@ -23,7 +23,7 @@ It adds:
 - [Screenshots](#screenshots)
 - [Installing](#installing)
 - [The launcher](#the-launcher)
-- [NVIDIA DLSS / DLAA](#nvidia-dlss--dlaa)
+- [NVIDIA DLSS](#nvidia-dlss)
 - [Controllers](#controllers)
 - [Mods and cheats](#mods-and-cheats)
 - [Performance and how it's optimised](#performance-and-how-its-optimised)
@@ -38,8 +38,8 @@ It adds:
 | | Feature | What it does |
 |---|---|---|
 | 🚀 | **inFamous Launcher** | A WPF settings app and launcher: display, graphics, performance, controls, controller, audio, mods, saves and tools. Graphics presets, a live controller tester, save backups and play-time tracking |
-| ✨ | **NVIDIA DLAA (DLSS)** | DLSS anti-aliasing at native resolution, integrated straight into the renderer: sub-pixel jitter, a depth snapshot and camera motion vectors reconstructed from the game's own constants. Models K (DLSS 4) and **L / M (DLSS 4.5)** |
-| 🧠 | **DLSS 5 Neural Rendering** *(optional)* | One switch installs [OptiScaler](https://github.com/optiscaler/OptiScaler)-DLSSNR beside the game so NVIDIA's DLSS 5 model runs on top of DLAA. Bring your own files (see below) |
+| ✨ | **NVIDIA DLSS** | DLAA at native resolution, or **Quality / Balanced / Performance** upscaling from 67 / 58 / 50 % of it. Integrated straight into the renderer: sub-pixel jitter, a depth snapshot and camera motion vectors reconstructed from the game's own constants. Models K (DLSS 4) and **L / M (DLSS 4.5)** |
+| 🧠 | **DLSS 5 Neural Rendering** *(optional)* | One switch installs [OptiScaler](https://github.com/optiscaler/OptiScaler)-DLSSNR beside the game so NVIDIA's DLSS 5 model runs on top of DLSS. Bring your own files (see below) |
 | 🎮 | **PlayStation and Steam controllers** | DualSense, DualSense Edge, DualShock 4, Steam Controller and Switch Pro, by USB or Bluetooth, through SDL3. Includes rumble, a light bar that can follow Cole's karma, a touchpad mapping and battery display |
 | 🧪 | **Cheat mods** | Infinite XP, Max Karma (Hero or Infamous) and Unlock All Powers, as launcher mods you switch on and off |
 | ⚙️ | **Benchmarked defaults** | CPU-core placement, resolution and draw distance tuned with scripted, repeatable benchmark runs |
@@ -50,7 +50,7 @@ It adds:
 <table>
   <tr>
     <td><img src="docs/screenshots/launcher-home.jpg" alt="Launcher home page"/><br/><sub><b>Home</b>: play, quick settings, build, saves, trophies and play time</sub></td>
-    <td><img src="docs/screenshots/launcher-graphics.jpg" alt="Launcher graphics page"/><br/><sub><b>Graphics</b>: presets, texture filtering, DLAA and the DLSS model, draw distance</sub></td>
+    <td><img src="docs/screenshots/launcher-graphics.jpg" alt="Launcher graphics page"/><br/><sub><b>Graphics</b>: NVIDIA DLSS with its mode (DLAA, Quality, Balanced, Performance) and model</sub></td>
   </tr>
   <tr>
     <td><img src="docs/screenshots/launcher-controller.jpg" alt="Launcher controller page"/><br/><sub><b>Controller</b>: detected pads, live input view, battery, rumble and light bar tests</sub></td>
@@ -111,7 +111,7 @@ cd .. && launcher\build.cmd
 |---|---|
 | **Home** | Big Play button, quick settings (display mode, resolution, frame cap, VSync), one-click graphics presets, and the status of the build, saves, trophies and play time |
 | **Display** | The same settings as the in-game F10 menu: changing them in either place updates the other. It also suggests the resolution matching your monitor |
-| **Graphics** | Presets (PS3 Original → Ultra), shadows, anisotropic filtering, NVIDIA DLAA with the DLSS model, DLSS 5 Neural Rendering, and draw distance for the city, objects and vehicles |
+| **Graphics** | Presets (PS3 Original → Ultra), shadows, anisotropic filtering, NVIDIA DLSS (DLAA, Quality, Balanced, Performance) with the DLSS model, DLSS 5 Neural Rendering, and draw distance for the city, objects and vehicles |
 | **Performance** | Frame cap, adaptive draw distance (drops detail below a target frame rate and restores it above), CPU core placement for hybrid Intel CPUs, process priority |
 | **Controls** | Keyboard and mouse: raw input, 1:1 camera turning, linear response, invert, speed |
 | **Controller** | Every connected pad and how the game will read it, with a live view of what it sends, battery, vibration and light bar tests, plus deadzone, touchpad, rumble and light bar settings |
@@ -125,7 +125,7 @@ See [launcher/README.md](launcher/README.md) for the details.
 
 ---
 
-## NVIDIA DLSS / DLAA
+## NVIDIA DLSS
 
 ![Motion-vector check and the DLAA result](docs/screenshots/dlss-motion-vectors.jpg)
 
@@ -135,9 +135,19 @@ inFamous never had temporal anti-aliasing, so this fork builds everything DLSS n
 - **Camera:** inFamous renders camera-relative. The projection × rotation is recovered as the per-frame mode of vertex constants `c263..c266`. The camera's movement is the consensus of how static objects' camera-relative positions changed; typically 250+ objects agree within 0.5 cm.
 - **Depth:** a snapshot of the scene depth is taken right after the last scene draw, because the HUD clears it afterwards.
 - **Motion vectors:** each pixel is reprojected into the previous frame. A depth-consistency check catches what the camera can't explain. Where an object moves with the camera, as Cole does while you run, the pixel gets zero motion. Newly uncovered pixels keep the camera vector.
-- **HUD:** DLSS runs on the scene right after the post-processing composite. The HUD is then put back pixel-exact, so it is never smeared.
+- **HUD:** DLSS runs on the scene right after the post-processing composite. The HUD is then put back over DLSS's output: pixel-exact in DLAA, enlarged smoothly when upscaling, never smeared.
+- **Upscaling:** the renderer keeps two sizes. Render targets, depth and the display buffer use the mode's render size; the swap chain and window keep the output size. At present, DLSS writes the full-size image straight into the backbuffer. Menus, loading screens and videos, which skip DLSS, get a bilinear upscale. Without an RTX card the game falls back to rendering at full size.
 
-Pick the model on the Graphics page: **K** (DLSS 4) or **L / M** (DLSS 4.5). The `DLSS_DEBUG=mv|depth|zcheck` modes visualise the inputs; the image above is `zcheck`.
+| Mode | Renders at | At 1440p output | GPU load, test PC |
+|---|---|---|---|
+| **DLAA** | 100 % | 2560×1440 | 39 % |
+| Quality | 67 % | 1708×960 | 26 % |
+| Balanced | 58 % | 1486×836 | 24 % |
+| Performance | 50 % | 1280×720 | 19 % |
+
+The render size never drops below the PS3's own 720p, so at 720p output the upscaling modes act as DLAA. The jitter sequence and texture LOD bias follow NVIDIA's guidance for each mode's ratio. The game is CPU-bound, so the upscaling modes cut GPU load and heat rather than raising FPS (about 85 FPS in the city in all four).
+
+Pick the mode and the model on the Graphics page: **K** (DLSS 4) or **L / M** (DLSS 4.5). The `DLSS_DEBUG=mv|depth|zcheck` modes visualise the inputs; the image above is `zcheck`.
 
 **DLSS 5 Neural Rendering** is optional. NVIDIA ships no public integration for it, so it goes through *OptiScaler-DLSSNR*, a community build of OptiScaler.
 - **Bring your own files:** you supply the package and NVIDIA's `nvngx_dlssnr.dll` model yourself. Extract them into `launcher\dlss5\`; neither is redistributable, so neither is in this repo.
@@ -205,6 +215,7 @@ The defaults were chosen from **scripted, repeatable benchmark runs**:
 | **1440p native** (`RES_SCALE 2`) | **125.4 FPS** / 73 FPS 1 % low, GPU about 21 % busy |
 | 4K supersampled (`RES_SCALE 3`) | 114.0 FPS / 63 FPS 1 % low, GPU about 32 % busy (kept 1440p) |
 | **DLAA on** (1440p, models K / L / M) | No measurable FPS change: the game is CPU-bound and the render thread idles about 7 ms per frame |
+| **DLSS Quality / Balanced / Performance** (1440p output) | Same FPS as DLAA; GPU load 39 % → 26 / 24 / 19 % |
 
 The resolution runs were separate runs rather than in-run A/B, so treat those numbers as indicative.
 

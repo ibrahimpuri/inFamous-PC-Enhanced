@@ -274,13 +274,17 @@ namespace InfamousLauncher
                    new Opt("-1", "Game default"), new Opt("0", "Bilinear"), new Opt("4", "4× anisotropic"), new Opt("8", "8× anisotropic"), new Opt("16", "16× anisotropic"));
             Toggle(Store.Ini, "TEX_MIPS", "Mipmaps", "Smaller texture levels for distant surfaces. Turning them off shimmers badly; keep on.", "1");
             group = "Anti-aliasing";
-            var dlss = Toggle(Store.Env, "DLSS", "NVIDIA DLAA (DLSS)", "DLSS anti-aliasing at the resolution chosen on the Display page: smooth, stable edges instead of jaggies and shimmer, with nothing upscaled. Cole can soften slightly while he animates. Needs an NVIDIA RTX graphics card; on other cards the game runs without it.", "0");
+            var dlss = Toggle(Store.Env, "DLSS", "NVIDIA DLSS", "DLSS anti-aliasing (DLAA) or upscaling (Quality / Balanced / Performance, below): smooth, stable edges instead of jaggies and shimmer. Cole can soften slightly while he animates. Needs an NVIDIA RTX graphics card; on other cards the game runs without it.", "0");
+            var dlssMode = Choice(Store.Env, "DLSS_MODE", "DLSS mode", "DLAA anti-aliases at the resolution on the Display page. The upscaling modes render the 3D scene at a lower resolution and DLSS rebuilds it at full size: less GPU work, the HUD enlarged smoothly. The game is mostly CPU-limited, so they lower GPU load and heat more than they raise FPS. It never renders below the PS3's own 720p.", null,
+                   new Opt(null, "DLAA · native resolution, best image"), new Opt("quality", "Quality · renders at 67 %"),
+                   new Opt("balanced", "Balanced · renders at 58 %"), new Opt("performance", "Performance · renders at 50 %"));
+            dlssMode.EnabledIf = "DLSS=1";
             dlss.Warn = "Uses the DLSS files in the dlss-sdk folder next to the game. The game's own updates replace the renderer: re-apply DLSS with launcher\\dlss\\apply-dlss.cmd afterwards.";
             var dlssModel = Choice(Store.Env, "DLSS_PRESET", "DLSS model", "The AI model DLSS uses. L and M are the newer DLSS 4.5 models: sharper, steadier and less ghosting, at a little more GPU time (made for RTX 40 and 50 series).", null,
                    new Opt(null, "Automatic (K, DLSS 4)"), new Opt("L", "L · DLSS 4.5, best quality"), new Opt("M", "M · DLSS 4.5, faster"),
                    new Opt("K", "K · DLSS 4"), new Opt("J", "J · DLSS 4, less ghosting, more flicker"));
             dlssModel.EnabledIf = "DLSS=1";
-            var nr = Toggle(Store.Launcher, "launcher.dlss5", "DLSS 5 Neural Rendering", "NVIDIA's DLSS 5 model run over the DLAA image: synthesised lighting and material detail, HUD untouched. Driven through OptiScaler (a community mod, not NVIDIA's own integration); its overlay opens with the Insert key, under \"DLSS Neural Rendering\". Needs an RTX 50 series card. Applied when you press Play.", "0");
+            var nr = Toggle(Store.Launcher, "launcher.dlss5", "DLSS 5 Neural Rendering", "NVIDIA's DLSS 5 model run over the DLSS image: synthesised lighting and material detail, HUD untouched. Driven through OptiScaler (a community mod, not NVIDIA's own integration); its overlay opens with the Insert key, under \"DLSS Neural Rendering\". Needs an RTX 50 series card. Applied when you press Play.", "0");
             nr.Warn = "Needs OptiScaler-DLSSNR extracted into launcher\\dlss5, plus NVIDIA's nvngx_dlssnr.dll in the same folder. Turn it off here if the game misbehaves.";
             nr.EnabledIf = "DLSS=1";
             nr.Experimental = true;

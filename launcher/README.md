@@ -74,14 +74,20 @@ The **Controller** page lists every connected controller with its type, connecti
 
 SDL3 (3.4.18, zlib licence) sits in `sdl3\` next to the game. The game loads `SDL3.dll` from there when it starts; without it, only XInput controllers work. After "Update inFamous", run `dlss\apply-dlss.cmd`: it re-applies the controller support with the other patches.
 
-## NVIDIA DLSS (DLAA)
+## NVIDIA DLSS (DLAA and upscaling)
 
-The Graphics page has an **NVIDIA DLAA (DLSS)** switch and a **DLSS model** choice. L and M are the DLSS 4.5 models.
-DLSS here anti-aliases at the chosen resolution; it doesn't upscale. It is added to the port's renderer by this
-launcher, not by upstream, so **after every "Update inFamous" run `dlss\apply-dlss.cmd`** to put it back and rebuild
-the game. Details, limits and debug switches: [dlss\README.md](dlss/README.md).
+The Graphics page has an **NVIDIA DLSS** switch, a **DLSS mode** and a **DLSS model** choice. L and M are the DLSS 4.5
+models. The modes:
+- **DLAA** anti-aliases at the chosen resolution.
+- **Quality / Balanced / Performance** render the 3D scene at 67 / 58 / 50 % of it, never below 720p, and DLSS
+  rebuilds the image at full size. The game is mostly CPU-limited, so they lower GPU load and heat more than they
+  raise FPS. At 720p output there is nothing to upscale, and they act as DLAA.
 
-**DLSS 5 Neural Rendering** (same page) runs NVIDIA's DLSS 5 model over the DLAA image through OptiScaler-DLSSNR, a
+DLSS is added to the port's renderer by this launcher, not by upstream, so **after every "Update inFamous" run
+`dlss\apply-dlss.cmd`** to put it back and rebuild the game. Details, limits and debug switches:
+[dlss\README.md](dlss/README.md).
+
+**DLSS 5 Neural Rendering** (same page) runs NVIDIA's DLSS 5 model over the DLSS image through OptiScaler-DLSSNR, a
 community mod kept in `dlss5\`. When the switch is on, Play installs it beside the game exe as `dxgi.dll`; when it is
 off, Play removes it again. See the DLSS 5 section of [dlss\README.md](dlss/README.md).
 

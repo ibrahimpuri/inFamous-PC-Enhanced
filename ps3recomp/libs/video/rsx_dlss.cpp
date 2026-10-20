@@ -31,11 +31,16 @@ namespace {
 
 /* ---------------------------------------------------------------- configuration */
 struct Cfg {
-    int mode = 0;            /* 0 off, 1 DLAA */
+    int mode = 0;            /* 0 off, 1 on */
+    int up = 0;              /* DLSS_MODE: 0 DLAA, 1 Quality, 2 Balanced, 3 Performance, 4 Ultra Performance */
     int jitter = 1, mv = 1, mvfix = 1, debug_mv = 0, probe = 0;
     float mipbias = -1.0f, jsign = 1.0f;
+    int mipbias_set = 0;     /* DLSS_MIPBIAS given (else log2(render / output) - 1) */
     int preset = 0;          /* NVSDK_NGX_DLSS_Hint_Render_Preset value, 0 = default */
 };
+/* share of the output size each DLSS_MODE renders at (NVIDIA's ratios) */
+const float kModeRatio[5] = { 1.0f, 0.6667f, 0.58f, 0.5f, 0.3333f };
+const char* const kModeName[5] = { "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance" };
 Cfg g;
 int g_cfg_loaded = 0;
 
@@ -53,7 +58,13 @@ void cfg_load()
     if (e && _stricmp(e, "warp") == 0) g.debug_mv = 3;
     if (e && _stricmp(e, "nowarp") == 0) g.debug_mv = 4;
     if (e && _stricmp(e, "zcheck") == 0) g.debug_mv = 5;
-    if ((e = getenv("DLSS_MIPBIAS")) && *e) g.mipbias = (float)atof(e);
+    if ((e = getenv("DLSS_MIPBIAS")) && *e) { g.mipbias = (float)atof(e); g.mipbias_set = 1; }
+    if ((e = getenv("DLSS_MODE")) && *e) {
+        if (!_stricmp(e, "quality")) g.up = 1;
+        else if (!_stricmp(e, "balanced")) g.up = 2;
+        else if (!_stricmp(e, "performance")) g.up = 3;
+        else if (!_stricmp(e, "ultra") || !_stricmp(e, "ultraperformance")) g.up = 4;
+    }
     if ((e = getenv("DLSS_JSIGN")) && *e == '-') g.jsign = -1.0f;
     if ((e = getenv("DLSS_PROBE")) && *e) g.probe = atoi(e) > 0 ? atoi(e) : 1;
     if ((e = getenv("DLSS_PRESET")) && *e) {
@@ -68,7 +79,10 @@ int s_ngx_ok = 0, s_failed = 0;
 NVSDK_NGX_Parameter* s_params = nullptr;
 NVSDK_NGX_Handle* s_feature = nullptr;
 uint32_t s_feat_w = 0, s_feat_h = 0;
-uint32_t s_render_w = 0, s_render_h = 0;
+uint32_t s_render_w = 0, s_render_h = 0;   /* the size the game renders at */
+uint32_t s_out_w = 0, s_out_h = 0;         /* the size DLSS writes (the backbuffer); larger when upscaling */
+uint32_t s_jphases = 16;                   /* jitter sequence length: 8 x (output / render)^2, at least 16 */
+inline bool upscaling() { return s_out_w != s_render_w || s_out_h != s_render_h; }
 
 void fail(const char* what, long long code)
 {
@@ -76,7 +90,7 @@ void fail(const char* what, long long code)
     s_failed = 1;
 }
 
-/* ---------------------------------------------------------------- jitter (Halton 2,3; 16 phases) */
+/* ---------------------------------------------------------------- jitter (Halton 2,3; s_jphases phases) */
 float halton(int i, int b)
 {
     float f = 1.0f, r = 0.0f;
@@ -86,7 +100,7 @@ float halton(int i, int b)
 uint32_t s_rec_jidx = 0;                 /* presented frames handed off so far (record side) */
 void jitter_px(uint32_t k, float* jx, float* jy)
 {
-    const int i = (int)(k % 16u) + 1;
+    const int i = (int)(k % s_jphases) + 1;
     *jx = halton(i, 2) - 0.5f;
     *jy = halton(i, 3) - 0.5f;
 }
@@ -264,7 +278,7 @@ uint32_t s_res_w = 0, s_res_h = 0;
 ID3D12DescriptorHeap* s_heap = nullptr;   /* 0 depth SRV, 1-3 UAV mv/dz/out, 4-7 SRV scene/hud/prev/prev depth */
 UINT s_heap_inc = 0;
 ID3D12RootSignature* s_rs = nullptr;
-ID3D12PipelineState *s_pso_mv = nullptr, *s_pso_dbg = nullptr, *s_pso_merge = nullptr;
+ID3D12PipelineState *s_pso_mv = nullptr, *s_pso_dbg = nullptr, *s_pso_merge = nullptr, *s_pso_blit = nullptr;
 
 void release(ID3D12Resource*& r) { if (r) { r->Release(); r = nullptr; } }
 
@@ -279,11 +293,11 @@ ID3D12Resource* make_tex(DXGI_FORMAT fmt, uint32_t w, uint32_t h, D3D12_RESOURCE
     return r;
 }
 
-/* Shared by the motion-vector and debug passes. Constants: ic = inverse of this frame's camera, pv = last frame's
- * camera x the camera move; dims = size, this frame's jitter (px); opt.x = 0 no vectors, 1 camera only, 2 camera +
- * fallback; opt.zw = last frame's jitter. pz = last frame's depth. */
+/* Shared by all passes. Constants: ic = inverse of this frame's camera, pv = last frame's camera x the camera move;
+ * dims = render size, this frame's jitter (px); opt.x = 0 no vectors, 1 camera only, 2 camera + fallback;
+ * opt.zw = last frame's jitter; outd.xy = output size (= dims.xy unless upscaling). pz = last frame's depth. */
 #define DLSS_HLSL_COMMON \
-    "cbuffer K : register(b0) { float4 ic0, ic1, ic2, ic3; float4 pv0, pv1, pv2, pv3; float4 dims; float4 opt; };\n" \
+    "cbuffer K : register(b0) { float4 ic0, ic1, ic2, ic3; float4 pv0, pv1, pv2, pv3; float4 dims; float4 opt; float4 outd; };\n" \
     "Texture2D<float> pz : register(t4);\n" \
     /* relative distance error of a predicted last-frame depth zq against last frame's depth at pixel position pos, \
        best of the 2x2 texels around it (1 - z is proportional to 1 / distance here): .x its size (-1 = off-screen  \
@@ -343,7 +357,8 @@ const char* kCS =
  * gets (bright = near); DLSS_DEBUG=warp: |this frame - last frame fetched along the motion vectors| x4 (black where
  * the vectors are right), nowarp: the same without the vectors, for comparison; zcheck: which vector each pixel got
  * (green = the camera's, consistent with last frame's depth; cyan = zero motion, an object moving with the camera;
- * red = nothing fits, e.g. an animated character; orange = newly visible; blue = sky). Written over DLSS's output. */
+ * red = nothing fits, e.g. an animated character; orange = newly visible; blue = sky). Written over DLSS's output,
+ * which is the output size: each output pixel shows the render pixel under it. */
 const char* kCSDbg =
     DLSS_HLSL_COMMON
     "RWTexture2D<float2> mv : register(u0);\n"
@@ -353,52 +368,82 @@ const char* kCSDbg =
     "Texture2D<float4> pr : register(t3);\n"
     "float4 ld(int2 i) { return pr.Load(int3(clamp(i, int2(0, 0), int2(dims.xy) - 1), 0)); }\n"
     "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
-    "  if (id.x >= (uint)dims.x || id.y >= (uint)dims.y) return;\n"
+    "  if (id.x >= (uint)outd.x || id.y >= (uint)outd.y) return;\n"
+    "  const uint2 r = min(uint2(float2(id.xy) * dims.xy / outd.xy), uint2(dims.xy) - 1);\n"
     "  if (opt.y > 4.5) {\n"
-    "    float z = dz[id.xy];\n"
+    "    float z = dz[r];\n"
     "    if (z >= 1.0) { o[id.xy] = float4(0, 0, 0.4, 1); return; }\n"
     "    const float3 cols[4] = { float3(0, 1, 0), float3(0, 0.8, 1), float3(1, 0, 0), float3(1, 0.6, 0) };\n"
-    "    float3 c = opt.x > 0.5 ? cols[(int)pick(id.xy, z).z] : float3(1, 0, 1);\n"
-    "    float lum = dot(sc.Load(int3(id.xy, 0)).rgb, float3(0.3, 0.5, 0.2));\n"
+    "    float3 c = opt.x > 0.5 ? cols[(int)pick(r, z).z] : float3(1, 0, 1);\n"
+    "    float lum = dot(sc.Load(int3(r, 0)).rgb, float3(0.3, 0.5, 0.2));\n"
     "    o[id.xy] = float4(c * (0.35 + 0.65 * lum), 1);\n"
     "    return;\n"
     "  }\n"
     "  if (opt.y > 2.5) {\n"
     /* this pixel's sample, unjittered, moved by its vector, re-jittered with last frame's jitter (opt.zw) */
-    "    float2 m = opt.y > 3.5 ? float2(0, 0) : mv[id.xy];\n"
-    "    float2 q = float2(id.xy) + m - dims.zw + opt.zw;\n"
+    "    float2 m = opt.y > 3.5 ? float2(0, 0) : mv[r];\n"
+    "    float2 q = float2(r) + m - dims.zw + opt.zw;\n"
     "    int2 i = (int2)floor(q); float2 f = q - floor(q);\n"
     "    float4 p = lerp(lerp(ld(i), ld(i + int2(1, 0)), f.x), lerp(ld(i + int2(0, 1)), ld(i + int2(1, 1)), f.x), f.y);\n"
-    "    o[id.xy] = float4(saturate(abs(sc.Load(int3(id.xy, 0)).rgb - p.rgb) * 4.0), 1);\n"
+    "    o[id.xy] = float4(saturate(abs(sc.Load(int3(r, 0)).rgb - p.rgb) * 4.0), 1);\n"
     "    return;\n"
     "  }\n"
-    "  if (opt.y > 1.5) { float z = dz[id.xy]; float v = saturate((1.0 - z) * 200.0); o[id.xy] = float4(v, v, z >= 1.0 ? 1 : v, 1); return; }\n"
-    "  float2 m = mv[id.xy];\n"
+    "  if (opt.y > 1.5) { float z = dz[r]; float v = saturate((1.0 - z) * 200.0); o[id.xy] = float4(v, v, z >= 1.0 ? 1 : v, 1); return; }\n"
+    "  float2 m = mv[r];\n"
     "  o[id.xy] = float4(saturate(0.5 + m.x / 16.0), saturate(0.5 + m.y / 16.0), saturate(length(m) / 32.0), 1);\n"
     "}\n";
 
 /* Puts the HUD back: wherever the finished frame differs from the pre-HUD scene, the HUD (or a dialog) drew there,
- * so that pixel is taken from the finished frame instead of DLSS's output. */
+ * so that pixel is taken from the finished frame instead of DLSS's output. Both are render size and DLSS's output is
+ * the output size: each output pixel blends the 2x2 render pixels under it, so when upscaling the HUD is enlarged
+ * smoothly and its edges fade into the DLSS image. At the same size this is exactly a per-pixel replace. */
 const char* kCSMerge =
     DLSS_HLSL_COMMON
     "Texture2D<float4> sc : register(t1);\n"
     "Texture2D<float4> hu : register(t2);\n"
     "RWTexture2D<unorm float4> o : register(u2);\n"
     "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
-    "  if (id.x >= (uint)dims.x || id.y >= (uint)dims.y) return;\n"
-    "  float4 a = sc.Load(int3(id.xy, 0)), b = hu.Load(int3(id.xy, 0));\n"
-    "  if (any(abs(a.rgb - b.rgb) > 0.5 / 255.0)) o[id.xy] = float4(b.rgb, 1);\n"
+    "  if (id.x >= (uint)outd.x || id.y >= (uint)outd.y) return;\n"
+    "  float2 p = (float2(id.xy) + 0.5) * dims.xy / outd.xy - 0.5;\n"
+    "  int2 i = (int2)floor(p); float2 f = p - floor(p);\n"
+    "  float a = 0.0; float3 c = 0.0;\n"
+    "  [unroll] for (int k = 0; k < 4; k++) {\n"
+    "    int2 t = clamp(i + int2(k & 1, k >> 1), int2(0, 0), int2(dims.xy) - 1);\n"
+    "    float w = ((k & 1) ? f.x : 1.0 - f.x) * ((k >> 1) ? f.y : 1.0 - f.y);\n"
+    "    float4 s = sc.Load(int3(t, 0)), h = hu.Load(int3(t, 0));\n"
+    "    a += any(abs(s.rgb - h.rgb) > 0.5 / 255.0) ? w : 0.0;\n"
+    "    c += w * h.rgb;\n"
+    "  }\n"
+    "  if (a > 0.0) o[id.xy] = float4(a >= 1.0 ? c : lerp(o[id.xy].rgb, c, a), 1);\n"
+    "}\n";
+
+/* Upscaling, on frames DLSS does not run (menus, loading screens, videos): the finished frame (render size) enlarged
+ * to the output size, bilinear. */
+const char* kCSBlit =
+    DLSS_HLSL_COMMON
+    "Texture2D<float4> hu : register(t2);\n"
+    "RWTexture2D<unorm float4> o : register(u2);\n"
+    "[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {\n"
+    "  if (id.x >= (uint)outd.x || id.y >= (uint)outd.y) return;\n"
+    "  float2 p = (float2(id.xy) + 0.5) * dims.xy / outd.xy - 0.5;\n"
+    "  int2 i = (int2)floor(p); float2 f = p - floor(p);\n"
+    "  float3 c = 0.0;\n"
+    "  [unroll] for (int k = 0; k < 4; k++) {\n"
+    "    int2 t = clamp(i + int2(k & 1, k >> 1), int2(0, 0), int2(dims.xy) - 1);\n"
+    "    c += ((k & 1) ? f.x : 1.0 - f.x) * ((k >> 1) ? f.y : 1.0 - f.y) * hu.Load(int3(t, 0)).rgb;\n"
+    "  }\n"
+    "  o[id.xy] = float4(c, 1);\n"
     "}\n";
 
 int build_pipeline()
 {
     if (s_pso_mv) return 1;
-    /* root: [0] 40 constants b0, [1] SRV t0, [2] UAVs u0..u2, [3] SRVs t1..t4 */
+    /* root: [0] 44 constants b0, [1] SRV t0, [2] UAVs u0..u2, [3] SRVs t1..t4 */
     D3D12_DESCRIPTOR_RANGE r0 = {}; r0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r0.NumDescriptors = 1;
     D3D12_DESCRIPTOR_RANGE r1 = {}; r1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r1.NumDescriptors = 3;
     D3D12_DESCRIPTOR_RANGE r2 = {}; r2.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r2.NumDescriptors = 4; r2.BaseShaderRegister = 1;
     D3D12_ROOT_PARAMETER p[4] = {};
-    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 40;
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 44;
     p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[1].DescriptorTable.NumDescriptorRanges = 1;
     p[1].DescriptorTable.pDescriptorRanges = &r0; p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -415,10 +460,10 @@ int build_pipeline()
     HRESULT hr = s_dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&s_rs));
     sig->Release();
     if (FAILED(hr)) return 0;
-    const char* srcs[3] = { kCS, kCSDbg, kCSMerge };
-    const char* names[3] = { "dlss_mv", "dlss_dbg", "dlss_merge" };
-    ID3D12PipelineState** outs[3] = { &s_pso_mv, &s_pso_dbg, &s_pso_merge };
-    for (int k = 0; k < 3; k++) {
+    const char* srcs[4] = { kCS, kCSDbg, kCSMerge, kCSBlit };
+    const char* names[4] = { "dlss_mv", "dlss_dbg", "dlss_merge", "dlss_blit" };
+    ID3D12PipelineState** outs[4] = { &s_pso_mv, &s_pso_dbg, &s_pso_merge, &s_pso_blit };
+    for (int k = 0; k < 4; k++) {
         ID3DBlob *cs = nullptr; err = nullptr;
         if (FAILED(D3DCompile(srcs[k], strlen(srcs[k]), names[k], nullptr, nullptr, "main", "cs_5_0",
                               D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &err))) {
@@ -438,9 +483,14 @@ int build_pipeline()
     return 1;
 }
 
-int ensure_resources(uint32_t w, uint32_t h)
+/* Buffers at the render size (DLSS's inputs, the HUD snapshots, last frame's depth) and DLSS's output at the
+ * output size (the backbuffer). */
+uint32_t s_res_ow = 0, s_res_oh = 0;
+int ensure_resources()
 {
-    if (s_in && s_res_w == w && s_res_h == h) return 1;
+    const uint32_t w = s_render_w, h = s_render_h, ow = s_out_w, oh = s_out_h;
+    if (!w || !h || !ow || !oh) return 0;
+    if (s_in && s_res_w == w && s_res_h == h && s_res_ow == ow && s_res_oh == oh) return 1;
     release(s_in); release(s_out); release(s_mv); release(s_dz); release(s_hud); release(s_prev); release(s_pdz);
     s_csnap = 0;
     if (g.debug_mv == 3 || g.debug_mv == 4) {
@@ -451,12 +501,12 @@ int ensure_resources(uint32_t w, uint32_t h)
     s_pdz_st = D3D12_RESOURCE_STATE_COPY_DEST;
     s_in  = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
     s_hud = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    s_out = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s_out = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, ow, oh, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     s_mv  = make_tex(DXGI_FORMAT_R16G16_FLOAT, w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     s_dz  = make_tex(DXGI_FORMAT_R32_FLOAT, w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (!s_in || !s_out || !s_mv || !s_dz || !s_hud || !s_pdz) return 0;
     s_in_st = s_hud_st = D3D12_RESOURCE_STATE_COPY_DEST; s_out_st = s_mv_st = s_dz_st = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    s_res_w = w; s_res_h = h;
+    s_res_w = w; s_res_h = h; s_res_ow = ow; s_res_oh = oh;
     {   /* slots 4, 5: the pre-HUD scene and the finished frame, read by the merge */
         D3D12_CPU_DESCRIPTOR_HANDLE c = s_heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
@@ -474,7 +524,7 @@ int ensure_resources(uint32_t w, uint32_t h)
     u.Format = DXGI_FORMAT_R16G16_FLOAT; c.ptr += s_heap_inc; s_dev->CreateUnorderedAccessView(s_mv, nullptr, &u, c);
     u.Format = DXGI_FORMAT_R32_FLOAT;    c.ptr += s_heap_inc; s_dev->CreateUnorderedAccessView(s_dz, nullptr, &u, c);
     u.Format = DXGI_FORMAT_R8G8B8A8_UNORM; c.ptr += s_heap_inc; s_dev->CreateUnorderedAccessView(s_out, nullptr, &u, c);
-    fprintf(stderr, "[DLSS] buffers %ux%u ready%c", w, h, 10);
+    fprintf(stderr, "[DLSS] buffers ready: render %ux%u, output %ux%u%c", w, h, ow, oh, 10);
     return 1;
 }
 
@@ -521,20 +571,33 @@ int invert4(const float* m, float* o)
     return 1;
 }
 
-int create_feature(ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h)
+/* The DLSS feature: render size in, output size out. Quality mode = the user's DLSS_MODE when upscaling, else DLAA
+ * (also when upscaling was asked for but the render size ended up equal to the output, e.g. clamped at 720p). */
+int s_feat_mode = 0;
+int create_feature(ID3D12GraphicsCommandList* cl)
 {
-    if (s_feature && s_feat_w == w && s_feat_h == h) return 1;
+    const int mode = upscaling() ? (g.up ? g.up : 1) : 0;
+    if (s_feature && s_feat_w == s_render_w && s_feat_h == s_render_h && s_feat_mode == mode) return 1;
     if (s_feature) { NVSDK_NGX_D3D12_ReleaseFeature(s_feature); s_feature = nullptr; }
+    static const NVSDK_NGX_PerfQuality_Value pq[5] = { NVSDK_NGX_PerfQuality_Value_DLAA, NVSDK_NGX_PerfQuality_Value_MaxQuality,
+        NVSDK_NGX_PerfQuality_Value_Balanced, NVSDK_NGX_PerfQuality_Value_MaxPerf, NVSDK_NGX_PerfQuality_Value_UltraPerformance };
     NVSDK_NGX_DLSS_Create_Params cp = {};
-    cp.Feature.InWidth = w; cp.Feature.InHeight = h;
-    cp.Feature.InTargetWidth = w; cp.Feature.InTargetHeight = h;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InWidth = s_render_w; cp.Feature.InHeight = s_render_h;
+    cp.Feature.InTargetWidth = s_out_w; cp.Feature.InTargetHeight = s_out_h;
+    cp.Feature.InPerfQualityValue = pq[mode];
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    if (g.preset) NVSDK_NGX_Parameter_SetUI(s_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, (unsigned)g.preset);
+    if (g.preset) {   /* DLSS_PRESET: the same model for whichever mode is in use */
+        NVSDK_NGX_Parameter_SetUI(s_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, (unsigned)g.preset);
+        NVSDK_NGX_Parameter_SetUI(s_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, (unsigned)g.preset);
+        NVSDK_NGX_Parameter_SetUI(s_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, (unsigned)g.preset);
+        NVSDK_NGX_Parameter_SetUI(s_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, (unsigned)g.preset);
+        NVSDK_NGX_Parameter_SetUI(s_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, (unsigned)g.preset);
+    }
     NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(cl, 1, 1, &s_feature, s_params, &cp);
     if (NVSDK_NGX_FAILED(r)) { fail("DLSS feature creation", r); s_feature = nullptr; return 0; }
-    s_feat_w = w; s_feat_h = h;
-    fprintf(stderr, "[DLSS] DLAA %ux%u created (preset %s)%c", w, h, g.preset ? "set" : "default", 10);
+    s_feat_w = s_render_w; s_feat_h = s_render_h; s_feat_mode = mode;
+    fprintf(stderr, "[DLSS] %s %ux%u -> %ux%u created (preset %s)%c", kModeName[mode], s_render_w, s_render_h,
+            s_out_w, s_out_h, g.preset ? "set" : "default", 10);
     return 1;
 }
 
@@ -543,10 +606,23 @@ int create_feature(ID3D12GraphicsCommandList* cl, uint32_t w, uint32_t h)
 /* ======================================================================= C API */
 extern "C" {
 
-void rsx_dlss_device_init(ID3D12Device* dev, uint32_t render_w, uint32_t render_h)
+float rsx_dlss_render_ratio(void)
+{
+    cfg_load();
+    return (g.mode && g.up > 0 && g.up < 5) ? kModeRatio[g.up] : 1.0f;
+}
+
+void rsx_dlss_device_init(ID3D12Device* dev, uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h)
 {
     cfg_load();
     s_render_w = render_w; s_render_h = render_h;
+    s_out_w = out_w ? out_w : render_w; s_out_h = out_h ? out_h : render_h;
+    {   /* NVIDIA's guidance: texture LOD bias log2(render / output) - 1, and 8 x (output / render)^2 jitter phases */
+        const float ratio = s_out_w ? (float)s_render_w / (float)s_out_w : 1.0f;
+        if (!g.mipbias_set) g.mipbias = log2f(ratio) - 1.0f;
+        const float ph = 8.0f / (ratio * ratio);
+        s_jphases = ph > 64.0f ? 64u : ph < 16.0f ? 16u : (uint32_t)ceilf(ph);
+    }
     if (g.probe) { s_pskip = g.probe; fprintf(stderr, "[DLSS] probe armed: frame after %d gameplay frames%c", g.probe, 10); }
     if (!g.mode || !dev || s_ngx_ok || s_failed) return;
     s_dev = dev;
@@ -579,11 +655,13 @@ void rsx_dlss_device_init(ID3D12Device* dev, uint32_t render_w, uint32_t render_
         s_failed = 1; return;
     }
     s_ngx_ok = 1;
-    fprintf(stderr, "[DLSS] NGX ready: DLAA at %ux%u, jitter %s, motion vectors %s, mip bias %+.2f%c",
-            render_w, render_h, g.jitter ? "on" : "off", g.mv ? "on" : "off", g.mipbias, 10);
+    fprintf(stderr, "[DLSS] NGX ready: %s, render %ux%u -> output %ux%u, jitter %s (%u phases), motion vectors %s, mip bias %+.2f%c",
+            kModeName[upscaling() ? (g.up ? g.up : 1) : 0], s_render_w, s_render_h, s_out_w, s_out_h,
+            g.jitter ? "on" : "off", s_jphases, g.mv ? "on" : "off", g.mipbias, 10);
 }
 
 int rsx_dlss_active(void) { return s_ngx_ok && !s_failed; }
+int rsx_dlss_upscaling(void) { return rsx_dlss_active() && upscaling(); }
 int rsx_dlss_probe_on(void) { cfg_load(); return g.probe && s_pstate < 2; }
 float rsx_dlss_mip_bias(void) { cfg_load(); return (g.mode && !s_failed) ? g.mipbias : 0.0f; }
 
@@ -647,15 +725,26 @@ uint32_t rsx_dlss_exec_zeta(void) { return s_exec.zeta; }
 uint32_t rsx_dlss_exec_last_scene_draw(void) { return rsx_dlss_active() ? s_exec.last_q : 0xFFFFFFFFu; }
 uint32_t rsx_dlss_exec_composite_draw(void) { return rsx_dlss_active() ? s_exec.composite : 0xFFFFFFFFu; }
 
+/* The render-size colour snapshots must match the render size DLSS was set up for. */
+static int capture_ok(ID3D12Resource* src, const char* what)
+{
+    const D3D12_RESOURCE_DESC d = src->GetDesc();
+    if (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+        static int n = 0; if (n++ < 2) fprintf(stderr, "[DLSS] %s format %d is not RGBA8 -- not used%c", what, (int)d.Format, 10);
+        return 0;
+    }
+    if ((uint32_t)d.Width != s_render_w || d.Height != s_render_h) {
+        static int n = 0; if (n++ < 2) fprintf(stderr, "[DLSS] %s is %ux%u, not the render size %ux%u -- not used%c", what,
+                                               (uint32_t)d.Width, d.Height, s_render_w, s_render_h, 10);
+        return 0;
+    }
+    return build_pipeline() && ensure_resources();
+}
+
 void rsx_dlss_capture_color(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, uint32_t* state)
 {
     if (!rsx_dlss_active() || !cl || !src || !state) return;
-    const D3D12_RESOURCE_DESC d = src->GetDesc();
-    if (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
-        static int n = 0; if (n++ < 2) fprintf(stderr, "[DLSS] display buffer format %d is not RGBA8 -- HUD goes through DLSS%c", (int)d.Format, 10);
-        return;
-    }
-    if (!build_pipeline() || !ensure_resources((uint32_t)d.Width, d.Height)) return;
+    if (!capture_ok(src, "display buffer")) return;
     D3D12_RESOURCE_STATES st = (D3D12_RESOURCE_STATES)*state;
     const D3D12_RESOURCE_STATES orig = st;
     barrier(cl, src, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -664,6 +753,16 @@ void rsx_dlss_capture_color(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, 
     barrier(cl, src, st, orig);
     *state = (uint32_t)st;
     s_csnap = 1;
+}
+
+static int s_fsnap = 0;   /* upscaling: the finished frame (render size, with the HUD) taken into s_hud for this present */
+void rsx_dlss_capture_finished(ID3D12GraphicsCommandList* cl, ID3D12Resource* src)
+{
+    if (!rsx_dlss_upscaling() || !cl || !src) return;
+    if (!capture_ok(src, "finished frame")) return;
+    barrier(cl, s_hud, s_hud_st, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->CopyResource(s_hud, src);   /* src: COPY_SOURCE (the caller's) */
+    s_fsnap = 1;
 }
 
 void rsx_dlss_capture_depth(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, uint32_t* zstate)
@@ -687,40 +786,94 @@ void rsx_dlss_capture_depth(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, ui
     s_zsnap = 1;
 }
 
-void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint32_t w, uint32_t h,
-                        ID3D12Resource* zeta, uint32_t zeta_state)
+} // extern "C"
+
+namespace {
+int s_hist_ok = 0;   /* DLSS history belongs to an unbroken run of gameplay frames */
+
+void bind_compute(ID3D12GraphicsCommandList* cl, const float* k)
 {
-    if (!rsx_dlss_active() || !cl || !bb || !w || !h) return;
-    (void)zeta; (void)zeta_state;              /* the frame-end depth is the HUD's; the snapshot holds the scene */
-    static int s_hist_ok = 0;                  /* DLSS history belongs to an unbroken run of gameplay frames */
-    if (s_exec.qualifying < 50) { s_hist_ok = 0; s_zsnap = 0; return; }   /* menus, loading screens, video */
+    ID3D12DescriptorHeap* heaps[] = { s_heap };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootSignature(s_rs);
+    cl->SetComputeRoot32BitConstants(0, 44, k, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE g0 = s_heap->GetGPUDescriptorHandleForHeapStart(), g1 = g0, g4 = g0;
+    g1.ptr += s_heap_inc; g4.ptr += 4 * (UINT64)s_heap_inc;
+    cl->SetComputeRootDescriptorTable(1, g0);
+    cl->SetComputeRootDescriptorTable(2, g1);
+    cl->SetComputeRootDescriptorTable(3, g4);
+}
+
+void out_to_backbuffer(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb)
+{
+    D3D12_RESOURCE_STATES bb_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier(cl, s_out, s_out_st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->CopyResource(bb, s_out);
+    barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
+}
+
+/* Upscaling without DLSS this frame: the finished frame enlarged into the backbuffer. */
+void upscale_fallback(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb)
+{
+    if (!s_fsnap || !build_pipeline() || !ensure_resources()) return;
+    float k[44] = {0};
+    k[32] = (float)s_render_w; k[33] = (float)s_render_h; k[40] = (float)s_out_w; k[41] = (float)s_out_h;
+    barrier(cl, s_hud, s_hud_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(cl, s_out, s_out_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    bind_compute(cl, k);
+    cl->SetPipelineState(s_pso_blit);
+    cl->Dispatch((s_out_w + 7) / 8, (s_out_h + 7) / 8, 1);
+    uav_barrier(cl, s_out);
+    out_to_backbuffer(cl, bb);
+}
+
+/* One DLSS frame into the backbuffer. Returns 0 when DLSS did not run (nothing written to the backbuffer). */
+int dlss_frame(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb)
+{
+    const bool up = upscaling();
+    const uint32_t w = s_render_w, h = s_render_h, ow = s_out_w, oh = s_out_h;
+    if (s_exec.qualifying < 50) { s_hist_ok = 0; s_zsnap = 0; return 0; }   /* menus, loading screens, video */
     if (!s_zsnap || !s_zcopy) {
         static int n = 0; if (n++ < 3) fprintf(stderr, "[DLSS] no scene depth snapshot this frame -- skipped%c", 10);
-        s_hist_ok = 0; return;
+        s_hist_ok = 0; return 0;
     }
+    if (up && !s_fsnap) { s_hist_ok = 0; return 0; }   /* no finished frame to merge the HUD from */
     s_zsnap = 0;
     ID3D12Resource* const zs = s_zcopy;
-    if (!build_pipeline() || !ensure_resources(w, h)) { fail("DLSS resources", 0); return; }
-    if (!create_feature(cl, w, h)) return;
+    if (!build_pipeline() || !ensure_resources()) { fail("DLSS resources", 0); return 0; }
+    if (!create_feature(cl)) return 0;
 
-    /* 1. colour: the pre-HUD scene (taken right after the composite) + the finished frame for the HUD merge;
-     *    without that snapshot, the finished frame itself (the HUD then goes through DLSS too) */
-    D3D12_RESOURCE_STATES bb_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    /* 1. colour: the pre-HUD scene (taken right after the composite) + the finished frame for the HUD merge; without
+     *    that snapshot, the finished frame itself (the HUD then goes through DLSS too). DLAA takes the finished frame
+     *    from the backbuffer; upscaling took it from the display buffer (rsx_dlss_capture_finished). */
     const int merge = s_csnap;
     s_csnap = 0;
-    barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    if (merge) {
-        barrier(cl, s_hud, s_hud_st, D3D12_RESOURCE_STATE_COPY_DEST);
-        cl->CopyResource(s_hud, bb);
+    if (up) {
+        if (!merge) {
+            barrier(cl, s_hud, s_hud_st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(cl, s_in, s_in_st, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(s_in, s_hud);
+            static int n = 0; if (n++ < 3) fprintf(stderr, "[DLSS] no pre-HUD snapshot this frame -- HUD included%c", 10);
+        }
         barrier(cl, s_hud, s_hud_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     } else {
-        barrier(cl, s_in, s_in_st, D3D12_RESOURCE_STATE_COPY_DEST);
-        cl->CopyResource(s_in, bb);
-        static int n = 0; if (n++ < 3) fprintf(stderr, "[DLSS] no pre-HUD snapshot this frame -- HUD included%c", 10);
+        D3D12_RESOURCE_STATES bb_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (merge) {
+            barrier(cl, s_hud, s_hud_st, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(s_hud, bb);
+            barrier(cl, s_hud, s_hud_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        } else {
+            barrier(cl, s_in, s_in_st, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(s_in, bb);
+            static int n = 0; if (n++ < 3) fprintf(stderr, "[DLSS] no pre-HUD snapshot this frame -- HUD included%c", 10);
+        }
+        barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     barrier(cl, s_in, s_in_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    /* 2. depth copy + motion vectors */
+    /* 2. depth copy + motion vectors (render size) */
     barrier(cl, zs, s_zcopy_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(cl, s_mv, s_mv_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     barrier(cl, s_dz, s_dz_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -734,7 +887,7 @@ void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint3
             s_srv_for = zs;
         }
     }
-    float k[40] = {0};
+    float k[44] = {0};
     int mv_on = 0, cut = 0;
     if (g.mv) {
         const float* d = s_exec.delta;
@@ -749,23 +902,16 @@ void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint3
     }
     k[32] = (float)w; k[33] = (float)h; k[34] = s_exec.jx; k[35] = s_exec.jy;
     k[36] = mv_on ? (g.mvfix ? 2.0f : 1.0f) : 0.0f; k[37] = (float)g.debug_mv; k[38] = s_prev_jx; k[39] = s_prev_jy;
+    k[40] = (float)ow; k[41] = (float)oh;
     barrier(cl, s_pdz, s_pdz_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);   /* last frame's depth */
-    ID3D12DescriptorHeap* heaps[] = { s_heap };
-    cl->SetDescriptorHeaps(1, heaps);
-    cl->SetComputeRootSignature(s_rs);
+    bind_compute(cl, k);
     cl->SetPipelineState(s_pso_mv);
-    cl->SetComputeRoot32BitConstants(0, 40, k, 0);
-    D3D12_GPU_DESCRIPTOR_HANDLE g0 = s_heap->GetGPUDescriptorHandleForHeapStart(), g1 = g0, g4 = g0;
-    g1.ptr += s_heap_inc; g4.ptr += 4 * (UINT64)s_heap_inc;
-    cl->SetComputeRootDescriptorTable(1, g0);
-    cl->SetComputeRootDescriptorTable(2, g1);
-    cl->SetComputeRootDescriptorTable(3, g4);
     cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     uav_barrier(cl, s_mv); uav_barrier(cl, s_dz);
     barrier(cl, s_mv, s_mv_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(cl, s_dz, s_dz_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    /* 3. DLAA */
+    /* 3. DLSS: render size in, output size out */
     barrier(cl, s_out, s_out_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor = s_in; ep.Feature.pInOutput = s_out;
@@ -781,22 +927,14 @@ void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint3
     NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(cl, s_feature, s_params, &ep);
     if (NVSDK_NGX_FAILED(r)) {
         static int n = 0; if (n++ < 5) fprintf(stderr, "[DLSS] evaluate failed (0x%X)%c", (unsigned)r, 10);
-        barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
         s_hist_ok = 0;
-        return;
+        return 0;
     }
-    if (merge || g.debug_mv) {   /* NGX left its own heaps and state on the list */
-        cl->SetDescriptorHeaps(1, heaps);
-        cl->SetComputeRootSignature(s_rs);
-        cl->SetComputeRoot32BitConstants(0, 40, k, 0);
-        cl->SetComputeRootDescriptorTable(1, g0);
-        cl->SetComputeRootDescriptorTable(2, g1);
-        cl->SetComputeRootDescriptorTable(3, g4);
-    }
-    if (merge) {   /* 3b. the HUD back on top, untouched by DLSS */
+    if (merge || g.debug_mv) bind_compute(cl, k);   /* NGX left its own heaps and state on the list */
+    if (merge) {   /* 3b. the HUD back on top (output size; enlarged smoothly when upscaling) */
         cl->SetPipelineState(s_pso_merge);
         uav_barrier(cl, s_out);
-        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        cl->Dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
         uav_barrier(cl, s_out);
     }
     if (g.debug_mv) {   /* motion vectors / depth / reprojection error over the image */
@@ -805,7 +943,7 @@ void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint3
         barrier(cl, s_dz, s_dz_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (s_prev) barrier(cl, s_prev, s_prev_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         uav_barrier(cl, s_out);
-        cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        cl->Dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
         uav_barrier(cl, s_out);
         if (s_prev) {   /* this frame's input becomes the next one's "last frame" */
             barrier(cl, s_prev, s_prev_st, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -820,14 +958,25 @@ void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint3
     s_prev_jx = s_exec.jx; s_prev_jy = s_exec.jy;
 
     /* 4. out -> back buffer */
-    barrier(cl, s_out, s_out_st, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_COPY_DEST);
-    cl->CopyResource(bb, s_out);
-    barrier(cl, bb, bb_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    out_to_backbuffer(cl, bb);
 
     if (s_exec.cam_valid) { memcpy(s_prev_cam, s_exec.cam, 64); s_prev_cam_valid = 1; } else s_prev_cam_valid = 0;
     s_hist_ok = 1;
-    { static int n = 0; if (n++ == 0) fprintf(stderr, "[DLSS] first DLAA frame (%u jittered draws, depth 0x%X)%c", s_exec.qualifying, s_exec.zeta, 10); }
+    { static int n = 0; if (n++ == 0) fprintf(stderr, "[DLSS] first %s frame (%u jittered draws, depth 0x%X, %ux%u -> %ux%u)%c",
+                                              kModeName[s_feat_mode], s_exec.qualifying, s_exec.zeta, w, h, ow, oh, 10); }
+    return 1;
 }
+} // namespace
 
-} // extern "C"
+extern "C" void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint32_t w, uint32_t h,
+                                   ID3D12Resource* zeta, uint32_t zeta_state)
+{
+    if (!rsx_dlss_active() || !cl || !bb || !w || !h) return;
+    (void)zeta; (void)zeta_state;   /* the frame-end depth is the HUD's; the snapshot holds the scene */
+    if (w != s_out_w || h != s_out_h) {
+        static int n = 0; if (n++ < 3) fprintf(stderr, "[DLSS] backbuffer %ux%u is not the output size %ux%u -- skipped%c", w, h, s_out_w, s_out_h, 10);
+        return;
+    }
+    if (!dlss_frame(cl, bb) && upscaling()) upscale_fallback(cl, bb);   /* the backbuffer always gets the frame */
+    s_fsnap = 0;
+}

@@ -58,9 +58,63 @@ Hunk backend after 'if (lb && mip) sd.MipLODBias =' @'
 
 Hunk backend before '/* Create swap chain */' @'
 #ifdef PS3RECOMP_DLSS
-    rsx_dlss_device_init(s_d3d.device, BBW, BBH);   /* DLSS=1: start NGX (no-op otherwise) */
+    rsx_dlss_device_init(s_d3d.device, RBW, RBH, BBW, BBH);   /* DLSS=1: start NGX (no-op otherwise) */
+    if (s_outw && !rsx_dlss_active()) {   /* upscaling asked for, but no DLSS here: render at the full size after all */
+        s_bbw = s_outw; s_bbh = s_outh; s_res_scale = s_out_scale; s_outw = s_outh = 0;
+        fprintf(stderr, "[RES] DLSS unavailable: rendering at the output size %ux%u%c", s_bbw, s_bbh, 10);
+    }
 #endif
 
+'@
+
+# DLSS upscaling: the render size (RBW x RBH) and the output size (BBW x BBH) become separate
+Hunk backend before '#define BBW (s_bbw ? s_bbw : s_d3d.width)' @'
+/* DLSS upscaling renders below the output size: RBW x RBH = the internal render size (s_bbw: render targets, depth,
+ * the display buffer), BBW x BBH = the swap chain / window / overlay size (s_outw while upscaling, else the same). */
+static u32   s_outw = 0, s_outh = 0;
+static float s_out_scale = 1.0f;
+#define RBW (s_bbw ? s_bbw : s_d3d.width)
+#define RBH (s_bbh ? s_bbh : s_d3d.height)
+'@
+
+Hunk backend replace '#define BBW (s_bbw ? s_bbw : s_d3d.width)' '#define BBW (s_outw ? s_outw : RBW)'
+Hunk backend replace '#define BBH (s_bbh ? s_bbh : s_d3d.height)' '#define BBH (s_outh ? s_outh : RBH)'
+
+Hunk backend after 'fprintf(stderr, "[RES] v154 internal resolution %ux%u (RES_SCALE %.2f, guest %ux%u)%c", s_bbw, s_bbh, sc, width, height, 10);' @'
+#ifdef PS3RECOMP_DLSS
+        {   /* DLSS upscaling (DLSS_MODE quality / balanced / performance): the game renders at the mode's share of that
+             * size, never below the PS3's own 720p, and DLSS rebuilds the image at the full size */
+            float rs = sc * rsx_dlss_render_ratio();
+            if (rs < 1.0f) rs = 1.0f;
+            if (rs < sc - 0.001f) {
+                s_outw = s_bbw; s_outh = s_bbh; s_out_scale = sc;
+                s_res_scale = rs;
+                s_bbw = ((u32)((float)width * rs + 0.5f) + 1u) & ~1u;
+                s_bbh = ((u32)((float)height * rs + 0.5f) + 1u) & ~1u;
+                if (rs <= 1.0f) { s_bbw = width; s_bbh = height; }
+                fprintf(stderr, "[RES] DLSS upscaling: rendering %ux%u, output %ux%u%c", s_bbw, s_bbh, s_outw, s_outh, 10);
+            }
+        }
+#endif
+'@
+
+Hunk backend replace 's_d3d.off_rt[_k].w == BBW && s_d3d.off_rt[_k].h == BBH) {' 's_d3d.off_rt[_k].w == RBW && s_d3d.off_rt[_k].h == RBH) {'
+Hunk backend replace 's_d3d.off_rt[last_disp_slot].w == BBW && s_d3d.off_rt[last_disp_slot].h == BBH &&' 's_d3d.off_rt[last_disp_slot].w == RBW && s_d3d.off_rt[last_disp_slot].h == RBH &&'
+
+Hunk backend after 's_d3d.off_rt[last_disp_slot].dxgi == (u32)DXGI_FORMAT_R8G8B8A8_UNORM) {' @'
+#ifdef PS3RECOMP_DLSS
+              if (rsx_dlss_upscaling()) {   /* DLSS upscaling: the display buffer (render size) goes to DLSS, which fills the backbuffer */
+                  off_rt_transition(last_disp_slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                  rsx_dlss_capture_finished(s_d3d.cmd_list, s_d3d.off_rt[last_disp_slot].res);
+                  off_rt_transition(last_disp_slot, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                  cur_rt = 0x7FFF;   /* force the backbuffer rebind below */
+              } else
+#endif
+              {
+'@
+
+Hunk backend after 's_d3d.off_rt[last_disp_slot].off, last_disp_slot, 10); }' @'
+              }   /* DLSS upscaling: end of the copy branch */
 '@
 
 Hunk backend before '{   /* v219g VCB_DEDUP' @'

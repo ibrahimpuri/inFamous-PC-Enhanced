@@ -598,8 +598,14 @@ static D3D12State s_d3d;
  * attachment allocation and the per-draw viewport already go through. */
 static float s_res_scale = 1.0f;
 static u32   s_bbw = 0, s_bbh = 0;
-#define BBW (s_bbw ? s_bbw : s_d3d.width)
-#define BBH (s_bbh ? s_bbh : s_d3d.height)
+/* DLSS upscaling renders below the output size: RBW x RBH = the internal render size (s_bbw: render targets, depth,
+ * the display buffer), BBW x BBH = the swap chain / window / overlay size (s_outw while upscaling, else the same). */
+static u32   s_outw = 0, s_outh = 0;
+static float s_out_scale = 1.0f;
+#define RBW (s_bbw ? s_bbw : s_d3d.width)
+#define RBH (s_bbh ? s_bbh : s_d3d.height)
+#define BBW (s_outw ? s_outw : RBW)
+#define BBH (s_outh ? s_outh : RBH)
 static void res_scale_dims(u32* w, u32* h)
 {
     if (s_res_scale > 1.0f && s_bbw && *w == s_d3d.width && *h == s_d3d.height) { *w = s_bbw; *h = s_bbh; }
@@ -1492,7 +1498,11 @@ static int init_d3d12(u32 width, u32 height)
     }
 
 #ifdef PS3RECOMP_DLSS
-    rsx_dlss_device_init(s_d3d.device, BBW, BBH);   /* DLSS=1: start NGX (no-op otherwise) */
+    rsx_dlss_device_init(s_d3d.device, RBW, RBH, BBW, BBH);   /* DLSS=1: start NGX (no-op otherwise) */
+    if (s_outw && !rsx_dlss_active()) {   /* upscaling asked for, but no DLSS here: render at the full size after all */
+        s_bbw = s_outw; s_bbh = s_outh; s_res_scale = s_out_scale; s_outw = s_outh = 0;
+        fprintf(stderr, "[RES] DLSS unavailable: rendering at the output size %ux%u%c", s_bbw, s_bbh, 10);
+    }
 #endif
 
     /* Create swap chain */
@@ -10635,7 +10645,7 @@ static void render_frame_exec(void)
               if (s_df && fo) {
                   for (int _k = 0; _k < MAX_OFF_RTS; _k++)
                       if (s_d3d.off_rt[_k].res && s_d3d.off_rt[_k].off == fo &&
-                          s_d3d.off_rt[_k].w == BBW && s_d3d.off_rt[_k].h == BBH) {
+                          s_d3d.off_rt[_k].w == RBW && s_d3d.off_rt[_k].h == RBH) {
                           /* v62b: only if this frame actually drew into it -- a flipped buffer
                            * we never drew this frame showed a black screen entering the world */
                           if (_k < 64 && (disp_drawn >> _k) & 1ull) last_disp_slot = _k;
@@ -10645,8 +10655,17 @@ static void render_frame_exec(void)
               } }
             s_bp_last_slot = last_disp_slot; s_bp_last_drawn = disp_drawn;   /* v103A [BLACK]: the buffer presented */
             if (last_disp_slot >= 0 && s_d3d.off_rt[last_disp_slot].res &&
-                s_d3d.off_rt[last_disp_slot].w == BBW && s_d3d.off_rt[last_disp_slot].h == BBH &&
+                s_d3d.off_rt[last_disp_slot].w == RBW && s_d3d.off_rt[last_disp_slot].h == RBH &&
                 s_d3d.off_rt[last_disp_slot].dxgi == (u32)DXGI_FORMAT_R8G8B8A8_UNORM) {
+#ifdef PS3RECOMP_DLSS
+              if (rsx_dlss_upscaling()) {   /* DLSS upscaling: the display buffer (render size) goes to DLSS, which fills the backbuffer */
+                  off_rt_transition(last_disp_slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                  rsx_dlss_capture_finished(s_d3d.cmd_list, s_d3d.off_rt[last_disp_slot].res);
+                  off_rt_transition(last_disp_slot, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                  cur_rt = 0x7FFF;   /* force the backbuffer rebind below */
+              } else
+#endif
+              {
                 off_rt_transition(last_disp_slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 D3D12_RESOURCE_BARRIER bb = {0};
                 bb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -10667,6 +10686,7 @@ static void render_frame_exec(void)
                 { static int _n = 0; if ((_n < 3 && _n++ < 3))
                     fprintf(stderr, "[DISPRT] presented display buffer 0x%X (rt slot %d)%c",
                             s_d3d.off_rt[last_disp_slot].off, last_disp_slot, 10); }
+              }   /* DLSS upscaling: end of the copy branch */
             }
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
@@ -15565,6 +15585,21 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         s_bbh = ((u32)((float)height * sc + 0.5f) + 1u) & ~1u;
         if (sc <= 1.0f) { s_bbw = width; s_bbh = height; }
         fprintf(stderr, "[RES] v154 internal resolution %ux%u (RES_SCALE %.2f, guest %ux%u)%c", s_bbw, s_bbh, sc, width, height, 10);
+#ifdef PS3RECOMP_DLSS
+        {   /* DLSS upscaling (DLSS_MODE quality / balanced / performance): the game renders at the mode's share of that
+             * size, never below the PS3's own 720p, and DLSS rebuilds the image at the full size */
+            float rs = sc * rsx_dlss_render_ratio();
+            if (rs < 1.0f) rs = 1.0f;
+            if (rs < sc - 0.001f) {
+                s_outw = s_bbw; s_outh = s_bbh; s_out_scale = sc;
+                s_res_scale = rs;
+                s_bbw = ((u32)((float)width * rs + 0.5f) + 1u) & ~1u;
+                s_bbh = ((u32)((float)height * rs + 0.5f) + 1u) & ~1u;
+                if (rs <= 1.0f) { s_bbw = width; s_bbh = height; }
+                fprintf(stderr, "[RES] DLSS upscaling: rendering %ux%u, output %ux%u%c", s_bbw, s_bbh, s_outw, s_outh, 10);
+            }
+        }
+#endif
     }
     s_d3d.clear_color[0] = 0.0f;
     s_d3d.clear_color[1] = 0.0f;

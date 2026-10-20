@@ -476,6 +476,7 @@ namespace InfamousLauncher
             parts.Add(Label(fs, M.Get(fs)).Replace(" (borderless)", ""));
             string c = M.Get(cap);
             parts.Add(c == "0" ? "uncapped" : Label(cap, c).Replace(" (PS3)", ""));
+            if (Inv.Same(M.Get("DLSS"), "1")) { var dm = Catalog.Find("DLSS_MODE"); parts.Add("DLSS " + Label(dm, M.Get(dm)).Split('·')[0].Trim()); }
             int mods = M.EnabledMods.Count();
             if (mods > 0) parts.Add(mods + (mods == 1 ? " mod" : " mods"));
             return string.Join(" · ", parts);
