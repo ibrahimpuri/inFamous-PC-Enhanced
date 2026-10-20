@@ -312,6 +312,75 @@ static void pad_merge_sdl3(void)
 #endif
 '@
 
+# The controller in use is player 1 (PAD_FOLLOW_ACTIVE): its block goes in front of the SDL3 merge block above
+Hunk cellpad after '#endif /* PAD_BACKEND_XINPUT */' @'
+#if PAD_BACKEND_XINPUT
+/* inFamous launcher: the controller in use is player 1. The game reads port 0, and XInput slot N is port N, so any
+ * XInput device in slot 0 (a DS4Windows / Steam / ViGEm virtual pad, a wheel, an idle receiver) kept a PlayStation
+ * controller on port 1, where the game never looks. Now a connected controller that sends input while the one on
+ * port 0 is idle takes port 0 (the two swap) until another one is used. PAD_FOLLOW_ACTIVE=0 = the fixed order.
+ * s_xi_slot[port] = the XInput slot behind a port, for XInput rumble. */
+static int s_xi_slot[PAD_MAX_HOST_PORTS] = { 0, 1, 2, 3 };
+#ifdef PS3RECOMP_SDL3
+static int s_sdl_slot[PAD_MAX_HOST_PORTS];   /* defined with the SDL3 merge below */
+#endif
+static int pad_in_use(const PadHostState* h)
+{
+    return h->connected && (h->buttons || h->trigger_l2 > 30 || h->trigger_r2 > 30 ||
+           h->analog_lx < 64 || h->analog_lx > 192 || h->analog_ly < 64 || h->analog_ly > 192 ||
+           h->analog_rx < 64 || h->analog_rx > 192 || h->analog_ry < 64 || h->analog_ry > 192);
+}
+static void pad_follow_active(void)
+{
+    static int on = -1, lead_key = -1;   /* the leading controller: its XInput slot, or 100 + its SDL3 pad index */
+    if (on < 0) {
+        const char* e = getenv("PAD_FOLLOW_ACTIVE");
+        on = !(e && *e == '0');
+        printf("[cellPad] player 1 = %s\n", on ? "the controller in use (PAD_FOLLOW_ACTIVE=0: the first connected)" : "the first connected controller");
+        fflush(stdout);
+    }
+    int key[PAD_MAX_HOST_PORTS];
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        s_xi_slot[i] = i;
+#ifdef PS3RECOMP_SDL3
+        key[i] = !s_host_state[i].connected ? -1 : s_sdl_slot[i] >= 0 ? 100 + s_sdl_slot[i] : i;
+#else
+        key[i] = s_host_state[i].connected ? i : -1;
+#endif
+    }
+    if (!on) return;
+    int lead = -1;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) if (key[i] >= 0 && key[i] == lead_key) lead = i;
+    if (lead < 0) lead_key = -1;   /* the leading controller is gone: the usual order again */
+    if (lead < 0 || !pad_in_use(&s_host_state[lead])) {
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+            if (i == lead || !pad_in_use(&s_host_state[i])) continue;
+            if (key[i] != lead_key && (lead_key >= 0 || i > 0)) {
+                printf("[cellPad] player 1 is now %s %d (it was used)\n", key[i] >= 100 ? "PlayStation / Steam controller" : "XInput controller", key[i] >= 100 ? key[i] - 100 + 1 : key[i] + 1);
+                fflush(stdout);
+            }
+            lead = i; lead_key = key[i];
+            break;
+        }
+    }
+    if (lead <= 0) return;
+    const PadHostState t = s_host_state[0]; s_host_state[0] = s_host_state[lead]; s_host_state[lead] = t;
+    s_xi_slot[0] = lead; s_xi_slot[lead] = 0;
+#ifdef PS3RECOMP_SDL3
+    const int k = s_sdl_slot[0]; s_sdl_slot[0] = s_sdl_slot[lead]; s_sdl_slot[lead] = k;
+#endif
+}
+#endif
+'@
+
+Hunk cellpad before '    s_pad_xinput_merged = s_host_state[0].connected;' @'
+#if PAD_BACKEND_XINPUT
+    pad_follow_active();   /* inFamous launcher: the controller in use is player 1 (PAD_FOLLOW_ACTIVE=0 = off) */
+#endif
+'@
+
+Hunk cellpad replace 'XInputSetState((DWORD)port_no, &vib);' 'XInputSetState((DWORD)s_xi_slot[port_no], &vib);   /* the XInput pad behind the port (PAD_FOLLOW_ACTIVE) */'
+
 Hunk cellpad after 'pad_poll_xinput();' @'
 #ifdef PS3RECOMP_SDL3
     pad_merge_sdl3();   /* PlayStation / Steam controllers into the ports XInput left empty */

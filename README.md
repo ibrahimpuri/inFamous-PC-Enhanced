@@ -290,6 +290,8 @@ inFamous has no language menu: it follows the PS3's system language, and the por
 - **Prompts:** the game shows its PS3 button prompts.
 - **Light bar:** can follow your karma, blue for good and red for evil.
 - **Hot-plug:** a pad connected mid-game is picked up within half a second.
+- **The controller you use is player 1.** The game reads player 1 only, and used to give that to the first XInput pad, so a virtual pad from Steam or DS4Windows, a wheel or an idle receiver could keep a DualSense from working. Now whichever controller you press a button on becomes player 1 (Controller page: *Player 1 is the controller you use*, `PAD_FOLLOW_ACTIVE`).
+- **Launcher's Controller page:** shows every controller the way the game reads it, Xbox pads included, live. If Windows sees a controller the game can't read, it says why (a program such as DS4Windows, DSX or reWASD holding it, Steam Input, a Bluetooth pairing). **Copy controller report** puts everything needed to help you on the clipboard.
 - **SDL3:** 3.4.18 (zlib licence) is included in `sdl3\`. If `SDL3.dll` is missing, the game falls back to XInput.
 
 ## Mods and cheats

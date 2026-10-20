@@ -55,13 +55,17 @@ The **Controller** page lists every connected controller with its type, connecti
 |---|---|
 | DualSense, DualSense Edge, DualShock 4 (USB or Bluetooth) | Directly, through SDL3 (`infamous-recomp`'s cellPad + `ps3recomp\libs\input\pad_sdl3.c`) |
 | Steam Controller | Directly through SDL3, or through Steam Input (as an Xbox controller) if you play from Steam |
-| Xbox and other XInput pads, Steam Input's virtual pads | XInput, as before |
+| Xbox and other XInput pads, Steam Input's / DS4Windows' virtual pads | XInput, as before (the page reads them through XInput too, slot by slot) |
 
 **Button mapping:**
 - **Face buttons:** used positionally, so Cross is the bottom button on every pad.
 - **Create / Share and the touchpad click:** SELECT.
 - **Options:** START.
 - **Back paddles and grips** (DualSense Edge, Steam Controller): L3 / R3.
+
+**Player 1:** the game reads player 1 only. **Player 1 is the controller you use** (on by default, `PAD_FOLLOW_ACTIVE`): whichever connected controller you press a button on, or move a stick of, while player 1's is idle becomes player 1, and its vibration follows. Before, the first XInput pad was always player 1, so a virtual or idle XInput device kept a DualSense on player 2, where the game never looks. `play.out.log` says `[cellPad] player 1 is now ...` when it changes.
+
+**When a controller doesn't work:** the page compares what Windows sees with what the game can read, and says what to do: a controller tool (DS4Windows, DSX, reWASD) or HidHide holding the pad, Steam Input also reading it, SDL3 or the controller patch missing, PlayStation reading switched off, or a Bluetooth pad worth pairing again. **Copy controller report** copies the controllers, the settings, other controller programs and the last game start's `[cellPad]` lines, to paste when asking for help.
 
 **Settings on the page:**
 - **Stick deadzone:** for PlayStation and Steam pads.

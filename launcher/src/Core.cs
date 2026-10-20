@@ -410,6 +410,7 @@ namespace InfamousLauncher
                    new Opt("FF1E00", "Red"), new Opt("A020F0", "Purple"), new Opt("FFFFFF", "White"), new Opt("off", "Off"));
             steamPad.EnabledIf = deadzone.EnabledIf = touchpad.EnabledIf = lightbar.EnabledIf = "PAD_SDL=1";
             group = "All controllers";
+            Toggle(Store.Env, "PAD_FOLLOW_ACTIVE", "Player 1 is the controller you use", "The game reads player 1 only. With this on, the controller you press a button on becomes player 1, so another pad Windows sees (a virtual one from Steam or DS4Windows, a wheel, an idle receiver) can't take its place. Off: the first connected controller, Xbox ones first.", "1");
             Toggle(Store.Env, "PAD_RUMBLE", "Vibration", "Controller rumble when the game asks for it.", "1");
 
             // ---------------- Audio ----------------

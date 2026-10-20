@@ -37,7 +37,7 @@ __declspec(selectany) volatile uint32_t g_pad_lightbar_rgb = 0;
 #define SDLFN(X) X(SDL_Init) X(SDL_SetHint) X(SDL_GetError) X(SDL_free) X(SDL_GetGamepads) X(SDL_OpenGamepad) \
     X(SDL_CloseGamepad) X(SDL_GamepadConnected) X(SDL_GetGamepadID) X(SDL_GetGamepadType) X(SDL_GetGamepadName) \
     X(SDL_GetGamepadButton) X(SDL_GetGamepadAxis) X(SDL_UpdateGamepads) X(SDL_RumbleGamepad) X(SDL_SetGamepadLED) \
-    X(SDL_SetGamepadPlayerIndex) X(SDL_GetGamepadConnectionState) X(SDL_GetGamepadTypeForID)
+    X(SDL_SetGamepadPlayerIndex) X(SDL_GetGamepadConnectionState) X(SDL_GetGamepadTypeForID) X(SDL_GetGamepadNameForID)
 #define SDL_DECL(n) static __typeof__(n)* p_##n;
 SDLFN(SDL_DECL)
 
@@ -195,6 +195,18 @@ static void close_pad(int i)
     InterlockedExchange(&s_rumble_req[MAXPADS - 1], 0);
 }
 
+/* Says once per device why a gamepad SDL sees is not used, so play.out.log shows it. */
+static void note_once(SDL_JoystickID id, const char* why)
+{
+    static SDL_JoystickID seen[32];
+    static int nseen = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == id) return;
+    if (nseen < 32) seen[nseen++] = id;
+    const char* name = p_SDL_GetGamepadNameForID(id);
+    printf("[cellPad] SDL3: %s %s\n", name ? name : "gamepad", why);
+    fflush(stdout);
+}
+
 static void rescan(void)
 {
     int n = 0;
@@ -205,9 +217,14 @@ static void rescan(void)
         for (int i = 0; i < s_nopen; i++) if (s_open[i].id == ids[k]) open = 1;
         if (open) continue;
         const SDL_GamepadType t = p_SDL_GetGamepadTypeForID(ids[k]);
-        if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE) continue;   /* XInput has those */
+        if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE) { note_once(ids[k], "is left to XInput"); continue; }
         SDL_Gamepad* g = p_SDL_OpenGamepad(ids[k]);
-        if (!g) continue;
+        if (!g) {
+            char why[200];
+            snprintf(why, sizeof why, "could not be opened (%s): another program may have it to itself (DS4Windows, DSX, HidHide, reWASD)", p_SDL_GetError());
+            note_once(ids[k], why);
+            continue;
+        }
         OpenPad* o = &s_open[s_nopen++];
         memset(o, 0, sizeof *o);
         o->gp = g; o->id = ids[k];
