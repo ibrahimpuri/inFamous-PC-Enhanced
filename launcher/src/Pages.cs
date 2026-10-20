@@ -454,21 +454,22 @@ namespace InfamousLauncher
             grid.Children.Add(Tile("\uE74E", "Save games", slots == 0 ? "None yet" : slots + (slots == 1 ? " slot" : " slots"),
                                    slots == 0 ? "Saves appear after you play" : "Last saved " + last.ToString("d MMM, HH:mm", Inv.C), "Accent", new Thickness(0, 0, 12, 16)));
 
-            // trophies
-            int tro = 0; long newest = 0;
+            // trophies (click: the Trophies page)
+            string troValue = "\u2014", troSub = "Unlock them in game";
             try
             {
-                if (Directory.Exists(M.TrophyDir))
-                    foreach (var f in Directory.GetFiles(M.TrophyDir, "*.json"))
-                    {
-                        string j = File.ReadAllText(f);
-                        tro += Regex.Matches(j, "\"id\"").Count;
-                        foreach (Match m in Regex.Matches(j, "\"timestamp\"\\s*:\\s*(\\d+)")) newest = Math.Max(newest, long.Parse(m.Groups[1].Value));
-                    }
+                var tl = Trophies.Load(M);
+                int tro = tl.Count(t => t.Unlocked);
+                troValue = tl.Problem == null ? tro + " of " + tl.All.Count : tro + " unlocked";
+                var newest = tl.All.Where(t => t.Unlocked && !t.Counted).OrderByDescending(t => t.UnlockedAt).FirstOrDefault();
+                if (newest != null) troSub = "Latest " + new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(newest.UnlockedAt).ToLocalTime().ToString("d MMM yyyy", Inv.C);
             }
             catch { }
-            string troSub = newest > 0 ? "Latest " + new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(newest).ToLocalTime().ToString("d MMM yyyy", Inv.C) : "Unlock them in game";
-            grid.Children.Add(Tile("\uE734", "Trophies", tro + " unlocked", troSub, "Warn", new Thickness(0, 0, 12, 16)));
+            var troTile = (Border)Tile("\uE734", "Trophies", troValue, troSub, "Warn", new Thickness(0, 0, 12, 16));
+            troTile.Cursor = Cursors.Hand;
+            troTile.ToolTip = "See every trophy";
+            troTile.MouseLeftButtonUp += (s, e) => Navigate("trophies");
+            grid.Children.Add(troTile);
 
             // play time
             string pt = M.Cfg.PlaySeconds > 0 ? Inv.Duration(TimeSpan.FromSeconds(M.Cfg.PlaySeconds)) : "—";

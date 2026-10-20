@@ -84,6 +84,20 @@ inFamous has no language menu of its own. **Display › Language** picks the voi
 
 It sets `PS3_LANG` for the game. Before this, the port only offered English, French and Spanish. The patch behind it is put back with the others after an update (see [launcher/dlss/README.md](dlss/README.md#game-language) for how it works).
 
+## Trophies
+
+The **Trophies** page lists all 50 of the game's trophies and which ones you've unlocked.
+- **Each trophy:** its icon, name, description, grade (platinum, gold, silver or bronze) and the date you unlocked it. Locked trophies are greyed out.
+- **At the top:** how many you have, a count per grade and your latest unlock. Filter by All, Unlocked or Locked.
+- **Hidden trophies** (4) show as *Hidden trophy* until you unlock them, or until you switch on *Show the hidden trophies*.
+- **Language:** names and descriptions follow the Language setting.
+- **The platinum:** the port doesn't award it, so the page counts it as earned once the other 49 are unlocked.
+- **Up to date:** the game records each unlock as you play, and the page reloads when you switch back to the launcher. The Home page's Trophies tile opens it.
+
+Where it reads from:
+- **Names, icons and grades:** the trophy pack in your own dump (`PS3_GAME\TROPDIR\NPWR00660_00\TROPHY.TRP`). Nothing from it is copied or shipped.
+- **Unlocks:** the port's record, `infamous-recomp\gamedata\trophies\NPWR00660.json`. The Tools page's **Back up now** includes it.
+
 ## NVIDIA DLSS, AMD FSR and frame generation
 
 The Graphics page has an **NVIDIA DLSS** switch, a **DLSS mode** and a **DLSS model** choice. L and M are the DLSS 4.5

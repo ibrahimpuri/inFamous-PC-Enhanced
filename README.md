@@ -52,6 +52,7 @@ It adds:
 | 🥔 | **Potato PC preset + Low-end CPU mode** | On four cores the shipped thread setup livelocked; Low-end CPU mode fixes it. On a budget-quad-core stand-in the game goes from never loading to about 49 FPS |
 | 🌍 | **Every language on the disc** | Display › Language: English, English (UK), French, German, Italian, Spanish, Dutch, Polish, Portuguese and Russian with their voices, plus Korean and Chinese text. The port used to offer only English, French and Spanish. Saves work in every language |
 | 🎮 | **PlayStation and Steam controllers** | DualSense, DualSense Edge, DualShock 4, Steam Controller and Switch Pro, by USB or Bluetooth, through SDL3. Includes rumble, a light bar that can follow Cole's karma, a touchpad mapping and battery display |
+| 🏆 | **Trophies page** | Every trophy with its icon, grade and description, unlocked or locked, with dates and progress. Read from your own dump's trophy pack and the port's unlock record |
 | 🧪 | **Cheat mods** | Infinite XP, Max Karma (Hero or Infamous) and Unlock All Powers, as launcher mods you switch on and off |
 | ⚙️ | **Benchmarked defaults** | CPU-core placement, resolution and draw distance tuned with scripted, repeatable benchmark runs |
 | 🔁 | **Survives upstream updates** | `launcher\dlss\apply-dlss.cmd` re-applies every patch after an upstream update and rebuilds. It only adds hooks that are missing, and backs out if a build fails |
@@ -134,6 +135,7 @@ cd .. && launcher\build.cmd
 | **Controls** | Keyboard and mouse: raw input, 1:1 camera turning, linear response, invert, speed |
 | **Controller** | Every connected pad and how the game will read it, with a live view of what it sends, battery, vibration and light bar tests, plus deadzone, touchpad, rumble and light bar settings |
 | **Audio** | Buffer size, dropout concealment, time-stretching during stalls, high-priority audio threads |
+| **Trophies** | All 50 trophies with their icons, grades and descriptions, which ones you've unlocked and when, filters and per-grade progress |
 | **Mods** | Folders under `infamous-recomp\mods`, each a `mod.ini` with env overrides. Switch them on or off, or create a new one |
 | **Advanced / Tools** | Every raw environment variable, one-click save backups (zip), update checks, the prerequisites doctor |
 

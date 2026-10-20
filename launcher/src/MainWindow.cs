@@ -275,6 +275,7 @@ namespace InfamousLauncher
             AddNav(navStack, "controller", "\uE7FC", "Controller");
             AddNav(navStack, "audio", "", "Audio");
             NavLabel(navStack, "MORE");
+            AddNav(navStack, "trophies", "", "Trophies");
             AddNav(navStack, "mods", "", "Mods");
             AddNav(navStack, "advanced", "", "Advanced");
             AddNav(navStack, "tools", "", "Tools");
@@ -354,6 +355,7 @@ namespace InfamousLauncher
                 case "input": content = SettingsPage("input", "Controls", "Keyboard and mouse. Controllers have their own page."); break;
                 case "controller": content = ControllerPage(); break;
                 case "audio": content = SettingsPage("audio", "Audio", null); break;
+                case "trophies": content = TrophiesPage(); break;
                 case "mods": content = ModsPage(); break;
                 case "advanced": content = AdvancedPage(); break;
                 default: content = ToolsPage(); break;
@@ -394,6 +396,7 @@ namespace InfamousLauncher
             }
             else if (M.IniChangedOnDisk()) { M.ReloadIni(); reload = true; }
             try { var g = PortPatches.Missing(M); if (g.Count != patchesGone.Count) { patchesGone = g; reload = true; } } catch { }
+            if (page == "trophies" && Trophies.Stamp(M) != trophyStamp) reload = true;   // the game recorded a new trophy
             if (reload && page != null && !IsTyping()) RebuildPage();
         }
         bool IsTyping() { return Keyboard.FocusedElement is TextBox; }
