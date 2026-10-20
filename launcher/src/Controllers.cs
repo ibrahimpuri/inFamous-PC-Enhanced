@@ -258,7 +258,43 @@ namespace InfamousLauncher
         [DllImport("setupapi.dll", SetLastError = true)] static extern bool SetupDiEnumDeviceInfo(IntPtr set, uint index, ref DevInfo data);
         [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool SetupDiGetDeviceInstanceIdW(IntPtr set, ref DevInfo data, StringBuilder id, int size, out int required);
         [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+        [StructLayout(LayoutKind.Sequential)] struct PropKey { public Guid Fmtid; public uint Pid; }
+        [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool SetupDiGetDevicePropertyW(IntPtr set, ref DevInfo data, ref PropKey key, out uint type, byte[] buffer, uint size, out uint required, uint flags);
+        [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr set, ref DevInfo data, uint property, out uint type, byte[] buffer, uint size, out uint required);
         static Guid HidClass = new Guid("745a17a0-74d3-11d0-b6fe-00a0c90f57da");
+        static Guid BluetoothClass = new Guid("e0cbf06c-cd8b-4647-bb8a-263b43f0f974");
+        static readonly Regex PadName = new Regex(@"DualSense|DualShock|Wireless Controller|Pro Controller|Steam Controller", RegexOptions.IgnoreCase);
+
+        // Controllers paired over Bluetooth but not connected right now (Windows' Bluetooth list says "Paired"), by name
+        public static List<string> PairedNotConnected()
+        {
+            var list = new List<string>();
+            IntPtr set = SetupDiGetClassDevsW(ref BluetoothClass, IntPtr.Zero, IntPtr.Zero, 0x2 /* DIGCF_PRESENT */);
+            if (set == IntPtr.Zero || set == new IntPtr(-1)) return list;
+            try
+            {
+                var d = new DevInfo { Size = (uint)Marshal.SizeOf(typeof(DevInfo)) };
+                var sb = new StringBuilder(512);
+                var connectedKey = new PropKey { Fmtid = new Guid("83da6326-97a6-4088-9453-a1923f573b29"), Pid = 15 };   // DEVPKEY_Device_IsConnected
+                for (uint i = 0; SetupDiEnumDeviceInfo(set, i, ref d); i++)
+                {
+                    int req;
+                    if (!SetupDiGetDeviceInstanceIdW(set, ref d, sb, sb.Capacity, out req) || !sb.ToString().StartsWith(@"BTHENUM\DEV_", StringComparison.OrdinalIgnoreCase)) continue;
+                    uint type, need;
+                    var nameBuf = new byte[512];
+                    if (!SetupDiGetDeviceRegistryPropertyW(set, ref d, 0x0C /* SPDRP_FRIENDLYNAME */, out type, nameBuf, (uint)nameBuf.Length, out need)) continue;
+                    string name = Encoding.Unicode.GetString(nameBuf, 0, (int)Math.Min(need, (uint)nameBuf.Length)).TrimEnd('\0');
+                    if (!PadName.IsMatch(name)) continue;
+                    var val = new byte[4];
+                    if (SetupDiGetDevicePropertyW(set, ref d, ref connectedKey, out type, val, (uint)val.Length, out need, 0) && val[0] == 0)
+                        list.Add(name);
+                }
+            }
+            finally { SetupDiDestroyDeviceInfoList(set); }
+            return list;
+        }
 
         public sealed class Found { public ushort Vid, Pid; public bool Bluetooth; public string Name; public string Id; }
 
@@ -268,7 +304,8 @@ namespace InfamousLauncher
             { 0x054C0BA0, "DualShock 4 USB wireless adapter" }, { 0x054C0268, "DualShock 3" },
             { 0x28DE1102, "Steam Controller" }, { 0x28DE1142, "Steam Controller (wireless receiver)" }, { 0x057E2009, "Switch Pro Controller" },
         };
-        static readonly Regex VidPid = new Regex(@"VID(?:_|&)(?:0002|02)?([0-9A-F]{4})&PID(?:_|&)([0-9A-F]{4})", RegexOptions.IgnoreCase);
+        // USB: HID\VID_054C&PID_0CE6...; Bluetooth: HID\{00001124-...}_VID&0002054C_PID&0CE6...; Bluetooth LE: ..._VID&02045E_PID&0B13...
+        static readonly Regex VidPid = new Regex(@"VID(?:_|&)(?:0002|02)?([0-9A-F]{4})[&_]PID(?:_|&)([0-9A-F]{4})", RegexOptions.IgnoreCase);
 
         // PlayStation / Steam / Switch controllers present right now (one entry per controller and connection)
         public static List<Found> Controllers()
@@ -454,6 +491,13 @@ namespace InfamousLauncher
                                : "Another program has it to itself: close DS4Windows, DSX or reWASD if they run in the background, and check HidHide doesn't hide it. ") +
                          (h.Bluetooth ? "Over Bluetooth, also try removing the controller in Windows' Bluetooth settings and pairing it again (hold PS + Create until the light flashes)." : "Also try another USB port or cable (some cables only charge)."));
             }
+
+            List<string> sleeping;
+            try { sleeping = HidScan.PairedNotConnected(); } catch { sleeping = new List<string>(); }
+            foreach (var name in sleeping)
+                warn("", "Your " + name + " is paired over Bluetooth but not connected right now, so nothing can read it. Press its PS (or Home) button: " +
+                     "the light comes on and it appears above within a few seconds. If it doesn't, remove it in Windows' Bluetooth settings and pair it again " +
+                     "(for a DualSense, hold PS + Create until the light bar flashes quickly). Unplug its USB cable first: while it's plugged in, it uses USB.");
 
             bool steam = procs.Contains("steam");
             if (steam && padPanels.Any(p => p.XiSlot < 0))
@@ -694,6 +738,7 @@ namespace InfamousLauncher
             try { hid = HidScan.Controllers(); } catch { hid = new List<HidScan.Found>(); }
             if (hid.Count == 0) sb.AppendLine("  none");
             foreach (var h in hid) sb.AppendLine("  " + h.Name + " " + h.Vid.ToString("X4") + ":" + h.Pid.ToString("X4") + (h.Bluetooth ? " Bluetooth" : " USB") + "  " + h.Id);
+            try { foreach (var n in HidScan.PairedNotConnected()) sb.AppendLine("  " + n + ": paired over Bluetooth, NOT connected"); } catch { }
             var procs = RunningProcs();
             var others = PadTools.Concat(new[] { "steam", "hidhide", "hidhideclient" }).Where(procs.Contains).ToList();
             sb.AppendLine("Programs that also read controllers: " + (others.Count > 0 ? string.Join(", ", others) : "none running"));
