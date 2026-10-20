@@ -44,6 +44,8 @@ The installer runs these steps:
    `installer/patches/` and checks again. The result is byte-identical to the maintainer's tree.
 8. It runs CMake and Ninja with clang-cl, using the same settings as `build.cmd`.
 9. It writes `Play inFamous.cmd`.
+10. It builds the settings launcher (`launcher\build.cmd` -> `inFamous Launcher.exe`) when the tree has one and its
+    sources are newer than the exe. A failure there is only a warning: the game runs without it.
 
 Finished steps are skipped when you run the installer again, so an interrupted install continues
 where it stopped. `--regen` starts the pipeline over.
@@ -75,7 +77,8 @@ the C++ build tools, with **Install** buttons that use winget) → Your game (pi
 game folder; encrypted Redump images work with their `.dkey` next to them) → Install location →
 progress bar → **Play**. It carries the whole publishable tree inside itself, extracts it to the
 chosen folder, copies the game out of the disc image, runs `infamous-installer install` there and
-creates `inFamous.exe` (starts the game without a console) plus desktop/Start-menu shortcuts.
+creates `inFamous.exe` (starts the game without a console) plus desktop/Start-menu shortcuts. The shortcuts
+and the final button open `inFamous Launcher.exe` when the install built it, otherwise `inFamous.exe`.
 Running it again on the same folder repairs/updates and only redoes what changed.
 
 Build it (maintainer, after `make-patches`):

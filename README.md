@@ -55,6 +55,7 @@ It adds:
 | 🏆 | **Trophies page** | Every trophy with its icon, grade and description, unlocked or locked, with dates and progress. Read from your own dump's trophy pack and the port's unlock record |
 | 🧪 | **Cheat mods** | Infinite XP, Max Karma (Hero or Infamous) and Unlock All Powers, as launcher mods you switch on and off |
 | ⚙️ | **Benchmarked defaults** | CPU-core placement, resolution and draw distance tuned with scripted, repeatable benchmark runs |
+| 📦 | **One-file install** | One `inFamous Setup.exe`: requirements, your dump, the game and the launcher, with shortcuts that open the launcher. Updates come straight from this fork |
 | 🔁 | **Survives upstream updates** | `launcher\dlss\apply-dlss.cmd` re-applies every patch after an upstream update and rebuilds. It only adds hooks that are missing, and backs out if a build fails |
 
 ## Screenshots
@@ -89,23 +90,26 @@ It adds:
 - **Your own inFamous disc dump**, European release (`BCES00220`): an `.iso` (with its `.dkey` if it's encrypted) or the game folder that contains `PS3_GAME`.
 - **Windows 10 or 11**, 64-bit, and a Direct3D 12 GPU. DLSS needs an NVIDIA RTX card; DLSS 5 needs an RTX 50 series card. AMD FSR and FSR frame generation work on any card (FSR 4 on Radeon RX 7000 / 9000).
 - **A CPU with SSE4.1** (2008 or newer). On CPUs without AVX2 (Intel before 2013, Pentium / Celeron without AVX, AMD before 2015), Setup builds a slower compatibility version automatically. On PCs with 16 or fewer CPU threads the game uses fewer threads and less CPU (tested down to 4 threads).
-- [**Python 3.10+**](https://www.python.org/downloads/), with "Add python.exe to PATH" ticked.
-- [**Visual Studio 2022 Build Tools**](https://visualstudio.microsoft.com/downloads/) with *Desktop development with C++* and the *C++ Clang Compiler for Windows* component.
+- **Python and the Visual Studio C++ Build Tools.** You don't have to get them yourself: Setup checks for them and installs them with one click each (through winget). If you'd rather do it by hand: [Python 3.10+](https://www.python.org/downloads/) with "Add python.exe to PATH" ticked, and the [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/) with *Desktop development with C++* and the *C++ Clang Compiler for Windows* component.
 - [**RPCS3**](https://rpcs3.net), only if your dump has `EBOOT.BIN` but no decrypted `EBOOT.elf`. It's used only to decrypt the executable.
-- About 10 GB of free disk space and 16 GB of RAM.
+- About 20 GB of free disk space (Setup shows exactly how much on its first page) and 16 GB of RAM.
 
-### Easy install (recommended)
+### Install
 
-1. **Install the base port.** Download **inFamous Setup.exe** from the [upstream releases](https://github.com/whompay/inFAMOUSreborn/releases), run it and pick your dump. It checks the requirements, copies the game out of your disc image, regenerates the code from your copy and builds it.
-2. **Optional, for DLSS:** download the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS/releases) (v310.9.16 or newer) and extract it to a `dlss-sdk` folder inside the install folder, so `dlss-sdk\include\nvsdk_ngx.h` exists. Do this *before* step 4; without it, everything else still works.
-   **Optional, for AMD FSR:** put the AMD FSR SDK 2.3.0 files in an `fsr-sdk` folder, keeping AMD's layout (the list is in [launcher/dlss/README.md](launcher/dlss/README.md#amd-fsr-31--fsr-4-and-fsr-frame-generation)). Either SDK is enough to build the upscaling.
-3. **Point the install at this fork.** In the install folder, open `installer\infamous.toml` and set:
-   ```toml
-   [update]
-   repo = "ibrahimpuri/inFamous-PC-Enhanced"
-   ```
-4. **Update.** Run **Update inFamous** (the Start-menu shortcut, or `Update inFamous.cmd`). The updater downloads only the files that differ from this fork, then rebuilds just what changed.
-5. **Build the launcher:** run `launcher\build.cmd`. It writes `inFamous Launcher.exe` into the install folder, using the C# compiler from the Build Tools you already have.
+1. **Download `inFamous Setup.exe`** from this fork's [latest release](https://github.com/ibrahimpuri/inFamous-PC-Enhanced/releases/latest). It's the only file you need.
+2. **Run it.** It checks the requirements (with Install buttons), asks for your dump (the `.iso` or the folder with `PS3_GAME`) and where to install, then builds everything: the game from your own copy, and the launcher. The first build takes a while (11 minutes on the 24-thread test PC; Setup estimates 20 to 60 minutes for most PCs).
+3. **Start inFamous** from the desktop or the Start menu. It opens the launcher: pick your settings and press **Play**.
+
+That's all. Updates come from this fork automatically (see [Updating](#updating)).
+
+**Optional, for DLSS / FSR upscaling:** these need SDK files you download yourself, so they're off until you add them.
+- **NVIDIA DLSS:** extract the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS/releases) (v310.9.16 or newer) to a `dlss-sdk` folder inside the install folder, so `dlss-sdk\include\nvsdk_ngx.h` exists.
+- **AMD FSR:** put the AMD FSR SDK 2.3.0 files in an `fsr-sdk` folder, keeping AMD's layout (the list is in [launcher/dlss/README.md](launcher/dlss/README.md#amd-fsr-31--fsr-4-and-fsr-frame-generation)).
+- **Then:** in the launcher, Tools › **Re-apply launcher patches**. It rebuilds the game with them (a few minutes).
+
+### Already installed?
+
+Whether you installed upstream's Setup or an older version of this fork: **run the new `inFamous Setup.exe` once and pick the same install folder.** It switches the install to this fork, rebuilds only what changed, builds the launcher and points the shortcuts at it. Your saves, trophies and settings stay.
 
 ### From source
 
@@ -114,10 +118,10 @@ git clone https://github.com/ibrahimpuri/inFamous-PC-Enhanced.git
 cd inFamous-PC-Enhanced\installer
 cargo build --release
 target\release\infamous-installer --game "D:\Dumps\inFamous"
-cd .. && launcher\build.cmd
 ```
 
-`infamous-installer doctor` only checks the requirements. An interrupted install continues where it stopped. See [installer/README.md](installer/README.md) for every step.
+The installer builds the launcher too. `infamous-installer doctor` only checks the requirements. An interrupted install continues where it stopped. To make the Setup: `infamous-installer package --out "dist\inFamous Setup.exe"`. See [installer/README.md](installer/README.md) for every step.
+
 
 ---
 
@@ -350,14 +354,19 @@ On a slower CPU, the **Potato PC** preset (with Low-end CPU mode) and the adapti
 
 ## Updating
 
-- **Players of this fork:** use **Update inFamous** once your install points at this repository (step 3 above).
-- **Upstream changes** reach this fork through GitHub's **Sync fork** button.
-- **Installs that track upstream (whompay/inFAMOUSreborn):** an upstream update or a repair restores the port's own copies of the four files this fork hooks into. That removes DLSS, the cheats and the controller support. The game still builds and runs without them.
-  - **Putting them back:**
-    - **Update from the launcher:** Tools › **Update now** re-applies them right after the update (`launcher\dlss\update-and-patch.cmd`).
-    - **Updated another way:** the launcher notices the missing hooks. The bottom bar says so, Play offers to put them back, and Tools › **Re-apply launcher patches** runs `launcher\dlss\apply-dlss.cmd`.
-  - **How the hooks are placed:** each one goes next to a line that must appear exactly once. If an update changed one of those lines, nothing is written, and you're told which patch needs porting by hand.
-  - **If the build fails:** the source is restored.
+- **Update:** in the launcher, Tools › **Update now**, or **Update inFamous** in the Start menu. It downloads only the files that changed in this fork, then rebuilds what needs it, including the launcher. Reopen the launcher afterwards.
+- **Upstream changes** reach this fork through GitHub's **Sync fork** button, so you get them with the same update.
+
+### If something goes wrong
+
+| Message or problem | What to do |
+|---|---|
+| `... arrived damaged or changed on GitHub during the update; run the update again` | Fixed on 20 Oct 2026: big updates (more than 150 changed files, such as the first update after switching to this fork) download one zip, and GitHub gave the `.cmd` / `.ps1` scripts in it different line endings. Run the update again. If it still stops, run the new `inFamous Setup.exe` on the same folder. |
+| The update ends with a note about the DLSS / FSR SDK | Only a note: without the optional SDKs the game is built without upscaling, and everything else works. |
+| The shortcut starts the game instead of the launcher, or there's no `inFamous Launcher.exe` | The launcher couldn't be built. Run `launcher\build.cmd` in the install folder to see why: it needs the C# compiler that comes with the Visual Studio Build Tools. |
+| *Launcher patches missing* in the launcher's bottom bar | An update from upstream removed them. Tools › **Re-apply launcher patches** puts them back, or run the new Setup on the same folder. |
+
+**Installs that still track upstream (whompay/inFAMOUSreborn)** get the port's own copies of the files this fork hooks into with every update, which removes DLSS / FSR, the cheats, the controller support and the language setting. Tools › **Update now** puts them back right after the update (`launcher\dlss\update-and-patch.cmd`); otherwise the launcher notices, and Tools › **Re-apply launcher patches** (`launcher\dlss\apply-dlss.cmd`) does it. Each hook goes next to a line that must appear exactly once; if an update changed one of those lines, nothing is written and you're told which patch needs porting by hand. If the build fails, the source is restored. Simpler: switch the install to this fork by running its Setup once.
 
 ## Project layout
 

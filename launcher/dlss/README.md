@@ -138,7 +138,7 @@ An update or a repair restores the port's own copies of the five files the patch
 The launcher's own files stay, and the game still builds and runs without them.
 
 **Getting them back:**
-- **Update from the launcher:** Tools › **Update now** runs `update-and-patch.cmd`. It runs the update, then this script, so nothing goes missing.
+- **Update from the launcher:** Tools › **Update now** runs `update-and-patch.cmd`. It runs the update, then this script, then rebuilds the launcher, so nothing goes missing.
 - **Updated another way** (the *Update inFamous* shortcut, or a repair): the launcher notices the missing hooks.
   - The bottom bar says so.
   - Play offers to put them back.
@@ -150,6 +150,8 @@ The script puts them all back and rebuilds the game, which takes a few minutes. 
 - **Backups:** the files as they were before patching are kept in `backup\<date-time>`.
 - **When it stops with "has to be ported by hand":** the update changed code next to one of the hooks. Nothing has been written, and the game runs fine without DLSS. The DLSS switch then simply does nothing.
 - **When the build fails:** the source is put back as it was. The log is in `build.log`.
+- **Without an SDK:** neither the DLSS SDK nor the FSR SDK is required. The script then notes that the game is built without upscaling and puts the other patches back as usual.
+- **Adding an SDK after installing:** put it in `dlss-sdk` / `fsr-sdk` and run this script (Tools › **Re-apply launcher patches**). It re-runs CMake before building, so the new SDK is picked up.
 
 ## Files
 
@@ -160,7 +162,7 @@ The script puts them all back and rebuilds the game, which takes a few minutes. 
 | `src\infamous_lang.h` | the game language behind the launcher's Language setting (see [Game language](#game-language)); the script copies it to `infamous-recomp` |
 | `src\pad_sdl3.c`, `src\pad_sdl3.h` | DualSense / DualShock 4 / Steam Controller support through SDL3 (`..\..\sdl3`); the script copies them to `ps3recomp\libs\input` |
 | `apply-dlss.ps1` / `.cmd` | re-applies the hooks in `rsx_d3d12_backend.c`, `cellPad.c`, `cellSysutil.c`, `ps3recomp\CMakeLists.txt` and `infamous-recomp\stubs.cpp`, then rebuilds |
-| `update-and-patch.cmd` | the launcher's *Update now*: `infamous-installer update`, then `apply-dlss.ps1` |
+| `update-and-patch.cmd` | the launcher's *Update now*: `infamous-installer update`, then `apply-dlss.ps1`, then `..\build.cmd` (the launcher) |
 | `original\` | the upstream files without the patches (refreshed to upstream `cdb581579f`), for testing the script |
 | `removed-upstream\` | stale `rsx_skate_actor.*` files an upstream update had left behind. They broke the build, so they were moved here |
 | `..\..\dlss-sdk\` | NVIDIA DLSS SDK 310.9.16 (headers, import library, `nvngx_dlss.dll`); see its `LICENSE.txt` |

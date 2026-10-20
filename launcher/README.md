@@ -180,8 +180,12 @@ So the 30 FPS cap holds with headroom. On the full 24-core CPU, Low-end CPU mode
 
 ## Building
 
+You don't normally build it yourself: the installer runs `build.cmd` after building the game (install, repair and every update, whenever the launcher's sources are newer than the exe), and Setup's shortcuts open it.
+
 `build.cmd` compiles `src\*.cs` with the Roslyn C# compiler from the Visual Studio Build Tools the port already
-needs, against .NET Framework 4.8 (part of Windows 10 and 11), and writes `..\inFamous Launcher.exe`.
+needs, against .NET Framework 4.8 (part of Windows 10 and 11), and writes `..\inFamous Launcher.exe`. A running
+launcher is renamed to `inFamous Launcher.old` first (Windows can't overwrite a running exe) and put back if the
+compile fails.
 `make_icon.ps1` redraws `assets\icon.ico`.
 
 ## Engine limits worth knowing
