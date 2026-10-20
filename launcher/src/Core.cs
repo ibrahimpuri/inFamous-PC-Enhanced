@@ -300,10 +300,23 @@ namespace InfamousLauncher
                    new Opt(null, "Automatic (K, DLSS 4)"), new Opt("L", "L · DLSS 4.5, best quality"), new Opt("M", "M · DLSS 4.5, faster"),
                    new Opt("K", "K · DLSS 4"), new Opt("J", "J · DLSS 4, less ghosting, more flicker"));
             dlssModel.EnabledIf = "DLSS=1";
+            dlss.EnabledIf = "FSR=0";
             var nr = Toggle(Store.Launcher, "launcher.dlss5", "DLSS 5 Neural Rendering", "NVIDIA's DLSS 5 model run over the DLSS image: synthesised lighting and material detail, HUD untouched. Driven through OptiScaler (a community mod, not NVIDIA's own integration); its overlay opens with the Insert key, under \"DLSS Neural Rendering\". Needs an RTX 50 series card. Applied when you press Play.", "0");
             nr.Warn = "Needs OptiScaler-DLSSNR extracted into launcher\\dlss5, plus NVIDIA's nvngx_dlssnr.dll in the same folder. Turn it off here if the game misbehaves.";
-            nr.EnabledIf = "DLSS=1";
+            nr.EnabledIf = "DLSS=1&FSR_FG=0";
             nr.Experimental = true;
+            var fsr = Toggle(Store.Env, "FSR", "AMD FSR", "AMD's upscaler, for every graphics card: FSR 4 (machine learning) on Radeon RX 7000 / 9000, FSR 3.1 on other GPUs, chosen automatically. Native AA anti-aliases at the resolution on the Display page; the other modes render the 3D scene smaller and FSR rebuilds it at full size. Use it instead of DLSS on AMD and Intel cards.", "0");
+            fsr.EnabledIf = "DLSS=0";
+            fsr.Warn = "Uses the AMD FSR SDK files in the fsr-sdk folder next to the game. The game's own updates replace the renderer: re-apply with launcher\\dlss\\apply-dlss.cmd afterwards (Tools page).";
+            Choice(Store.Env, "FSR_MODE", "FSR mode", "Like the DLSS modes, with AMD's ratios. It never renders below the PS3's own 720p.", null,
+                   new Opt(null, "Native AA · native resolution, best image"), new Opt("quality", "Quality · renders at 67 %"),
+                   new Opt("balanced", "Balanced · renders at 59 %"), new Opt("performance", "Performance · renders at 50 %")).EnabledIf = "FSR=1";
+            Slider("FSR_SHARPNESS", "FSR sharpening", "FSR's own sharpening pass on the upscaled image.", "0", 0, 1, 0.05,
+                   x => Math.Abs(x) < 1e-6 ? "Off" : (x * 100).ToString("0", Inv.C) + " %").EnabledIf = "FSR=1";
+            var fg = Toggle(Store.Env, "FSR_FG", "Frame generation (AMD FSR)", "Shows a generated frame between every two the game renders, so motion looks about twice as smooth. Most useful where the CPU limits the frame rate, such as crowded streets. Works with DLSS or FSR on, on any graphics card (FSR 3.1; FSR 4 frame generation on Radeon RX 9000). Adds a little input latency; best with a variable-refresh display and at least ~60 FPS before generation. The FPS counter in the port shows the rendered frames.", "0");
+            fg.EnabledIf = "DLSS=1|FSR=1";
+            fg.Warn = "While it is on, DLSS 5 Neural Rendering stays off (OptiScaler has its own swap chain handling).";
+            fg.Experimental = true;
             group = "World detail";
             Slider("LOD_CLASS_SCALE", "Draw distance", "Scales the city's level-of-detail switch distances: buildings, props and people keep their detail and appear farther away. Costs CPU and GPU time. Below 1× objects simplify and fade sooner than on the PS3, which helps slow PCs. F5 toggles it in game to compare.",
                    "1", 0.5, 4, 0.25, Times("PS3"));
@@ -422,7 +435,7 @@ namespace InfamousLauncher
             // cars, simplified far animation, 30 FPS) and keeps the GPU at the PS3's 720p with no extras.
             new Preset("Potato PC", "720p · 30 FPS · shortest draw distance, for low-end PCs",
                        "RES_SCALE=1", "TEX_ANISO=-1", "TEX_MIPS=1", "SHADOWS=0", "LOD_CLASS_SCALE=0.75", "LOD_DIST_SCALE=1", "CAR_DIST_SCALE=0.75",
-                       "UI_FPS_CAP=30", "ADAPT_LOD=0", "ANIM_LOD=1", "DLSS=0", "reshade.on=0", "launcher.lowcpu=1", "AUDIO_AHEAD_BLOCKS=24", "AUDIO_STRETCH=1"),
+                       "UI_FPS_CAP=30", "ADAPT_LOD=0", "ANIM_LOD=1", "DLSS=0", "FSR=0", "FSR_FG=0", "reshade.on=0", "launcher.lowcpu=1", "AUDIO_AHEAD_BLOCKS=24", "AUDIO_STRETCH=1"),
             new Preset("PS3 Original", "720p · 30 FPS · original draw distance",
                        "RES_SCALE=1", "TEX_ANISO=-1", "TEX_MIPS=1", "SHADOWS=1", "LOD_CLASS_SCALE=1", "LOD_DIST_SCALE=1", "CAR_DIST_SCALE=1", "UI_FPS_CAP=30", "ADAPT_LOD=0"),
             new Preset("Performance", "720p · no shadows · original draw distance",
@@ -868,7 +881,8 @@ namespace InfamousLauncher
         public const string ModelDll = "nvngx_dlssnr.dll";
         public static string Source(Model m) { return Path.Combine(m.P.LauncherDir, "dlss5"); }
         static string DlssRuntime(Model m) { return Path.Combine(m.P.Root, "dlss-sdk", "lib", "Windows_x86_64", "rel"); }
-        public static bool Wanted(Model m) { return m.Cfg.Dlss5 == "1" && Inv.Same(m.Get("DLSS"), "1"); }
+        // Off while FSR frame generation is on: its swap chain proxy and OptiScaler's would both take over presenting.
+        public static bool Wanted(Model m) { return m.Cfg.Dlss5 == "1" && Inv.Same(m.Get("DLSS"), "1") && !Inv.Same(m.Get("FSR_FG"), "1"); }
 
         public static bool IsOpti(string dll)
         {

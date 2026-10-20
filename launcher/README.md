@@ -75,7 +75,7 @@ The **Controller** page lists every connected controller with its type, connecti
 
 SDL3 (3.4.18, zlib licence) sits in `sdl3\` next to the game. The game loads `SDL3.dll` from there when it starts; without it, only XInput controllers work. After an update or repair, the controller support is put back with the other patches (see the DLSS section).
 
-## NVIDIA DLSS (DLAA and upscaling)
+## NVIDIA DLSS, AMD FSR and frame generation
 
 The Graphics page has an **NVIDIA DLSS** switch, a **DLSS mode** and a **DLSS model** choice. L and M are the DLSS 4.5
 models. The modes:
@@ -84,7 +84,15 @@ models. The modes:
   rebuilds the image at full size. The game is mostly CPU-limited, so they lower GPU load and heat more than they
   raise FPS. At 720p output there is nothing to upscale, and they act as DLAA.
 
-DLSS is added to the port's renderer by this launcher, not by upstream. An update or a repair restores the port's own
+**AMD FSR** (same page, instead of DLSS) works on every graphics card:
+- **Which FSR runs:** FSR 4 on Radeon RX 7000 / 9000, FSR 3.1 elsewhere.
+- **Modes:** Native AA / Quality / Balanced / Performance.
+- **Sharpening:** a slider for FSR's own sharpening pass.
+- **The files:** it needs the AMD FSR SDK files in `fsr-sdk\` next to the game.
+
+**Frame generation (AMD FSR)** shows a generated frame between every two rendered ones, with DLSS or FSR on and on any card. It's the setting that raises the frame rate you see where the CPU is the limit, as in crowded streets: about 89 rendered FPS became about 178 displayed on the test PC.
+
+All of this is added to the port's renderer by this launcher, not by upstream. An update or a repair restores the port's own
 files and so removes it, together with the controller support and the cheat hook.
 - **Updating from the launcher:** Tools › **Update now** puts them back right after updating.
 - **Updated another way:** the launcher notices the missing hooks. The bottom bar says so, Play offers to re-apply them, and Tools › **Re-apply launcher patches** runs `dlss\apply-dlss.cmd`.

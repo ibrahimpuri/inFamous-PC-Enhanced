@@ -1550,6 +1550,12 @@ static int init_d3d12(u32 width, u32 height)
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
+#ifdef PS3RECOMP_DLSS
+    /* FSR_FG=1: AMD FSR frame generation replaces the swap chain with its proxy (which presents real + generated frames) */
+    { const int fgw = rsx_dlss_wrap_swapchain((void**)&s_d3d.swap_chain, s_d3d.cmd_queue);
+      if (fgw < 0) { printf("[D3D12] ERROR: no swap chain left after the frame generation wrap\n"); return -1; }
+      if (fgw > 0) s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain); }
+#endif
     /* Create RTV descriptor heap */
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
     rtv_heap_desc.NumDescriptors = FRAME_COUNT;

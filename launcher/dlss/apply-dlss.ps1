@@ -67,6 +67,16 @@ Hunk backend before '/* Create swap chain */' @'
 
 '@
 
+# AMD FSR frame generation: wrap the swap chain before its buffers are taken
+Hunk backend before '/* Create RTV descriptor heap */' @'
+#ifdef PS3RECOMP_DLSS
+    /* FSR_FG=1: AMD FSR frame generation replaces the swap chain with its proxy (which presents real + generated frames) */
+    { const int fgw = rsx_dlss_wrap_swapchain((void**)&s_d3d.swap_chain, s_d3d.cmd_queue);
+      if (fgw < 0) { printf("[D3D12] ERROR: no swap chain left after the frame generation wrap\n"); return -1; }
+      if (fgw > 0) s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain); }
+#endif
+'@
+
 # DLSS upscaling: the render size (RBW x RBH) and the output size (BBW x BBH) become separate
 Hunk backend before '#define BBW (s_bbw ? s_bbw : s_d3d.width)' @'
 /* DLSS upscaling renders below the output size: RBW x RBH = the internal render size (s_bbw: render targets, depth,
@@ -205,12 +215,22 @@ Hunk backend after 's_rf_present = s_present_this_frame;' @'
 '@
 
 Hunk cmake after 'list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")' @'
-# Optional NVIDIA DLSS (DLAA) for the D3D12 backend (libs/video/rsx_dlss.cpp, DLSS=1 at run time). Built only when
-# the DLSS SDK files are present next to the checkout: dlss-sdk/include + lib/Windows_x86_64/x64/nvsdk_ngx_d.lib.
+# Optional temporal upscaling for the D3D12 backend (libs/video/rsx_dlss.cpp): NVIDIA DLSS (DLSS=1 at run time) when
+# the DLSS SDK is next to the checkout (dlss-sdk/include + lib/Windows_x86_64/x64/nvsdk_ngx_d.lib), AMD FSR 3.1 / 4
+# (FSR=1) when the AMD FSR SDK is (fsr-sdk/Kits/FidelityFX: headers; its signed DLLs are loaded at run time).
 set(PS3RECOMP_DLSS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../dlss-sdk" CACHE PATH "NVIDIA DLSS SDK folder (optional)")
-set(_ps3recomp_dlss OFF)
+set(PS3RECOMP_FSR_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../fsr-sdk" CACHE PATH "AMD FSR SDK folder (optional)")
+set(_ps3recomp_ngx OFF)
+set(_ps3recomp_ffx OFF)
 if(WIN32 AND EXISTS "${PS3RECOMP_DLSS_SDK}/include/nvsdk_ngx.h"
          AND EXISTS "${PS3RECOMP_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    set(_ps3recomp_ngx ON)
+endif()
+if(WIN32 AND EXISTS "${PS3RECOMP_FSR_SDK}/Kits/FidelityFX/upscalers/include/ffx_upscale.h")
+    set(_ps3recomp_ffx ON)
+endif()
+set(_ps3recomp_dlss OFF)
+if(_ps3recomp_ngx OR _ps3recomp_ffx)
     set(_ps3recomp_dlss ON)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_dlss.cpp")
 endif()
@@ -218,12 +238,22 @@ endif()
 
 Hunk cmake before '# HLE modules include their own headers' @'
 if(_ps3recomp_dlss)
-    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_DLSS_SDK}/include")
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_DLSS=1)
+endif()
+if(_ps3recomp_ngx)
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_DLSS_SDK}/include")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NGX=1)
     target_link_libraries(ps3recomp_runtime PUBLIC "${PS3RECOMP_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
     message(STATUS "  DLSS:         ON (${PS3RECOMP_DLSS_SDK})")
 else()
     message(STATUS "  DLSS:         off (no DLSS SDK in ${PS3RECOMP_DLSS_SDK})")
+endif()
+if(_ps3recomp_ffx)
+    target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_FSR_SDK}/Kits/FidelityFX")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFX=1)
+    message(STATUS "  FSR:          ON (${PS3RECOMP_FSR_SDK})")
+else()
+    message(STATUS "  FSR:          off (no AMD FSR SDK in ${PS3RECOMP_FSR_SDK})")
 endif()
 
 '@
@@ -347,11 +377,17 @@ function Patch([string]$path, [string]$which) {
 }
 
 Write-Host 'inFamous: re-applying the launcher''s port patches (NVIDIA DLSS, gameplay cheats, PlayStation / Steam controllers)'
-foreach ($f in 'include\nvsdk_ngx.h', 'lib\Windows_x86_64\x64\nvsdk_ngx_d.lib', 'lib\Windows_x86_64\rel\nvngx_dlss.dll') {
-    if (-not (Test-Path (Join-Path $sdk $f))) {
-        Fail "the DLSS SDK is missing ($sdk\$f). Download it from https://github.com/NVIDIA/DLSS (v310.9.16 or newer) into $sdk."
-    }
+# NVIDIA DLSS needs the DLSS SDK in <game>\dlss-sdk, AMD FSR the AMD FSR SDK files in <game>\fsr-sdk; one is enough.
+$hasNgx = @('include\nvsdk_ngx.h', 'lib\Windows_x86_64\x64\nvsdk_ngx_d.lib', 'lib\Windows_x86_64\rel\nvngx_dlss.dll') |
+          ForEach-Object { Test-Path (Join-Path $sdk $_) } | Where-Object { -not $_ } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+$fsr = Join-Path $root 'fsr-sdk'
+$hasFfx = (Test-Path (Join-Path $fsr 'Kits\FidelityFX\upscalers\include\ffx_upscale.h')) -and
+          (Test-Path (Join-Path $fsr 'Kits\FidelityFX\signedbin\amd_fidelityfx_loader_dx12.dll'))
+if (-not $hasNgx -and -not $hasFfx) {
+    Fail "neither the NVIDIA DLSS SDK ($sdk) nor the AMD FSR SDK ($fsr) is there. Download the DLSS SDK from https://github.com/NVIDIA/DLSS (v310.9.16 or newer) into $sdk, and/or the AMD FSR SDK files (see README.md) into $fsr."
 }
+if (-not $hasNgx) { Write-Host "  note: no DLSS SDK in $sdk -- the game is built without NVIDIA DLSS" -ForegroundColor Yellow }
+if (-not $hasFfx) { Write-Host "  note: no AMD FSR SDK in $fsr -- the game is built without AMD FSR" -ForegroundColor Yellow }
 foreach ($f in $backend, $cellpad, $cmake, $stubs) { if (-not (Test-Path $f)) { Fail "$f not found." } }
 if (-not (Test-Path (Join-Path $root 'sdl3\include\SDL3\SDL_gamepad.h'))) {
     Write-Host '  note: no SDL3 in <game>\sdl3 -- the game is built with Xbox (XInput) controllers only' -ForegroundColor Yellow

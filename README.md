@@ -5,6 +5,7 @@
 It adds:
 - a full launcher with every setting in one place;
 - **NVIDIA DLSS**: DLAA plus **Quality / Balanced / Performance** upscaling, wired into the port's own Direct3D 12 renderer;
+- **AMD FSR 3.1 / FSR 4** upscaling and **FSR frame generation**, for every graphics card;
 - optional **DLSS 5 Neural Rendering**;
 - **ReShade**, with effects written for inFamous: sharpening, clarity, ambient occlusion, debanding and colour;
 - a **Potato PC** preset and a **Low-end CPU mode** that make the game playable on quad-core CPUs;
@@ -26,6 +27,7 @@ It adds:
 - [Installing](#installing)
 - [The launcher](#the-launcher)
 - [NVIDIA DLSS](#nvidia-dlss)
+- [AMD FSR and frame generation](#amd-fsr-and-frame-generation)
 - [ReShade](#reshade)
 - [Potato PC and low-end CPUs](#potato-pc-and-low-end-cpus)
 - [Controllers](#controllers)
@@ -43,6 +45,7 @@ It adds:
 |---|---|---|
 | 🚀 | **inFamous Launcher** | A WPF settings app and launcher: display, graphics, performance, controls, controller, audio, mods, saves and tools. Graphics presets, a live controller tester, save backups and play-time tracking |
 | ✨ | **NVIDIA DLSS** | DLAA at native resolution, or **Quality / Balanced / Performance** upscaling from 67 / 58 / 50 % of it. Integrated straight into the renderer: sub-pixel jitter, a depth snapshot and camera motion vectors reconstructed from the game's own constants. Models K (DLSS 4) and **L / M (DLSS 4.5)** |
+| 🔴 | **AMD FSR + frame generation** | FSR 4 on Radeon RX 7000 / 9000, FSR 3.1 on every other card, fed the same jitter, depth and motion vectors as DLSS. FSR frame generation (with DLSS or FSR) doubles the frames you see where the CPU is the limit. Bring your own AMD FSR SDK files |
 | 🧠 | **DLSS 5 Neural Rendering** *(optional)* | One switch installs [OptiScaler](https://github.com/optiscaler/OptiScaler)-DLSSNR beside the game so NVIDIA's DLSS 5 model runs on top of DLSS. Bring your own files (see below) |
 | 🎨 | **ReShade** | A launcher page with four looks (Natural, Remastered, Vivid, Cinematic) and sliders. The effects in [`inFamous.fx`](launcher/reshade/shaders/inFamous.fx) were written for this game, including depth-based ambient occlusion that works with DLSS upscaling. Bring your own ReShade (one button) |
 | 🥔 | **Potato PC preset + Low-end CPU mode** | On four cores the shipped thread setup livelocked; Low-end CPU mode fixes it. On a budget-quad-core stand-in the game goes from never loading to about 49 FPS |
@@ -81,7 +84,7 @@ It adds:
 ### What you need
 
 - **Your own inFamous disc dump**, European release (`BCES00220`): an `.iso` (with its `.dkey` if it's encrypted) or the game folder that contains `PS3_GAME`.
-- **Windows 10 or 11**, 64-bit, and a Direct3D 12 GPU. DLSS needs an NVIDIA RTX card; DLSS 5 needs an RTX 50 series card.
+- **Windows 10 or 11**, 64-bit, and a Direct3D 12 GPU. DLSS needs an NVIDIA RTX card; DLSS 5 needs an RTX 50 series card. AMD FSR and FSR frame generation work on any card (FSR 4 on Radeon RX 7000 / 9000).
 - [**Python 3.10+**](https://www.python.org/downloads/), with "Add python.exe to PATH" ticked.
 - [**Visual Studio 2022 Build Tools**](https://visualstudio.microsoft.com/downloads/) with *Desktop development with C++* and the *C++ Clang Compiler for Windows* component.
 - [**RPCS3**](https://rpcs3.net), only if your dump has `EBOOT.BIN` but no decrypted `EBOOT.elf`. It's used only to decrypt the executable.
@@ -91,6 +94,7 @@ It adds:
 
 1. **Install the base port.** Download **inFamous Setup.exe** from the [upstream releases](https://github.com/whompay/inFAMOUSreborn/releases), run it and pick your dump. It checks the requirements, copies the game out of your disc image, regenerates the code from your copy and builds it.
 2. **Optional, for DLSS:** download the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS/releases) (v310.9.16 or newer) and extract it to a `dlss-sdk` folder inside the install folder, so `dlss-sdk\include\nvsdk_ngx.h` exists. Do this *before* step 4; without it, everything else still works.
+   **Optional, for AMD FSR:** put the AMD FSR SDK 2.3.0 files in an `fsr-sdk` folder, keeping AMD's layout (the list is in [launcher/dlss/README.md](launcher/dlss/README.md#amd-fsr-31--fsr-4-and-fsr-frame-generation)). Either SDK is enough to build the upscaling.
 3. **Point the install at this fork.** In the install folder, open `installer\infamous.toml` and set:
    ```toml
    [update]
@@ -121,7 +125,7 @@ cd .. && launcher\build.cmd
 |---|---|
 | **Home** | Big Play button, quick settings (display mode, resolution, frame cap, VSync), one-click graphics presets, and the status of the build, saves, trophies and play time |
 | **Display** | The same settings as the in-game F10 menu: changing them in either place updates the other. It also suggests the resolution matching your monitor |
-| **Graphics** | Presets (Potato PC, PS3 Original → Ultra), shadows, anisotropic filtering, NVIDIA DLSS (DLAA, Quality, Balanced, Performance) with the DLSS model, DLSS 5 Neural Rendering, and draw distance for the city, objects and vehicles |
+| **Graphics** | Presets (Potato PC, PS3 Original → Ultra), shadows, anisotropic filtering, NVIDIA DLSS (DLAA, Quality, Balanced, Performance) with the DLSS model, AMD FSR with its mode and sharpening, FSR frame generation (and a one-click FSR setup on Radeon cards), DLSS 5 Neural Rendering, and draw distance for the city, objects and vehicles |
 | **ReShade** | Looks and effect sliders for ReShade, which Play installs beside the game (see below) |
 | **Performance** | Frame cap, adaptive draw distance (drops detail below a target frame rate and restores it above), Low-end CPU mode, CPU core placement for hybrid Intel CPUs, process priority |
 | **Controls** | Keyboard and mouse: raw input, 1:1 camera turning, linear response, invert, speed |
@@ -165,6 +169,32 @@ Pick the mode and the model on the Graphics page: **K** (DLSS 4) or **L / M** (D
 - **Switching it on:** turn on *Graphics → DLSS 5 Neural Rendering*. The launcher installs OptiScaler as `dxgi.dll` beside the game when you press Play, and removes it again when the switch is off.
 
 See [launcher/dlss/README.md](launcher/dlss/README.md) for all switches and the limits.
+
+## AMD FSR and frame generation
+
+**AMD FSR** is the alternative to DLSS for every graphics card, through AMD's FSR API:
+- **Which FSR runs:** AMD's loader picks FSR 4 (machine learning) on Radeon RX 7000 / 9000 and FSR 3.1 everywhere else.
+- **Same inputs as DLSS:** jitter, depth snapshot, motion vectors and HUD handling.
+- **Modes:** Native AA, Quality (1.5×), Balanced (1.7×), Performance (2×), never below 720p, plus FSR's own sharpening.
+- **Radeon cards:** the Graphics page offers FSR Quality with frame generation in one click.
+
+**FSR frame generation** shows a generated frame between every two rendered ones.
+- **Works with DLSS or FSR,** on any graphics card.
+- **How it hooks in:** the port's swap chain is wrapped in AMD's frame generation swap chain, which presents and paces the frames.
+- **HUD stays sharp:** it gets the upscaled image from before the HUD went on, so the HUD isn't warped on generated frames.
+- **Off where it would look wrong:** menus, loading screens and videos.
+- **Where it helps:** the game is CPU-bound, so this is what raises the frame rate you see in crowded streets.
+
+| On the test PC (RTX 5070 Ti, 1440p) | Result |
+|---|---|
+| FSR 3.1 Quality, rooftop | ~89 FPS rendered, clean image; same detail as DLSS Quality at rest |
+| + FSR 3.1 frame generation | ~178 FPS displayed (NVIDIA overlay), HUD intact while panning |
+| DLSS Quality + FSR frame generation | works, HUD intact |
+
+**Bring your own files:** the AMD FSR SDK files are not in this repository. With only the FSR SDK (no DLSS SDK), the game is built with FSR alone.
+
+> [!NOTE]
+> FSR 4 needs a Radeon card, so it wasn't run here. It goes through the same calls as the FSR 3.1 path that was tested.
 
 ## ReShade
 
@@ -286,6 +316,8 @@ The defaults were chosen from **scripted, repeatable benchmark runs**:
 | **DLAA on** (1440p, models K / L / M) | No measurable FPS change: the game is CPU-bound and the render thread idles about 7 ms per frame |
 | **DLSS Quality / Balanced / Performance** (1440p output) | Same FPS as DLAA; GPU load 39 % → 26 / 24 / 19 % |
 | **Potato PC on four E-cores** (uncapped) | 48.9 FPS, 1 % low 32.6. With the shipped thread setup the game never reached the world |
+| **8 cores / 16 threads** (5800X3D-class stand-ins, High) | Shipped thread setup 85.6 / 88.6 FPS, Low-end CPU mode 87.0 / 89.5: the scheduler isn't the bottleneck there; frame generation is what helps in crowds |
+| **FSR frame generation** (FSR 3.1, rooftop) | ~89 FPS rendered → ~178 displayed |
 
 The resolution runs were separate runs rather than in-run A/B, so treat those numbers as indicative.
 
@@ -324,7 +356,7 @@ On a slower CPU, the **Potato PC** preset (with Low-end CPU mode) and the adapti
 Not in the repository, by design:
 - **Anything from the game:** dumps, `EBOOT`, the recompiled or lifted code, assets and saves.
 - **Per-player files:** your `launcher.ini`.
-- **Third-party files you download yourself:** the NVIDIA DLSS SDK, the DLSS 5 / OptiScaler package and ReShade.
+- **Third-party files you download yourself:** the NVIDIA DLSS SDK, the AMD FSR SDK, the DLSS 5 / OptiScaler package and ReShade.
 
 ## Credits and legal
 
@@ -333,10 +365,11 @@ Not in the repository, by design:
 - **Libraries and tools:**
   - [SDL](https://github.com/libsdl-org/SDL) (zlib licence, `sdl3/LICENSE.txt`).
   - [NVIDIA DLSS](https://github.com/NVIDIA/DLSS) (you download the SDK under NVIDIA's licence).
+  - [AMD FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) (optional, user-supplied; see its license).
   - [OptiScaler](https://github.com/optiscaler/OptiScaler) (optional, user-supplied).
   - [ReShade](https://reshade.me) by crosire (BSD-3-Clause; optional, user-supplied). The sharpening follows the algorithm of AMD FidelityFX CAS (MIT).
   - [RPCS3](https://rpcs3.net), used only to decrypt the game executable.
-- **Launcher, DLSS integration, ReShade effects, Low-end CPU mode, controller support and cheat mods:** this fork.
+- **Launcher, DLSS and FSR integration, ReShade effects, Low-end CPU mode, controller support and cheat mods:** this fork.
 - **The game:** *inFamous* © Sony Interactive Entertainment, developed by Sucker Punch Productions.
 
-This is an unofficial fan project, not affiliated with or endorsed by Sony Interactive Entertainment, Sucker Punch Productions, NVIDIA, Valve or ReShade. It distributes no game content: you need your own legally obtained copy of the game.
+This is an unofficial fan project, not affiliated with or endorsed by Sony Interactive Entertainment, Sucker Punch Productions, NVIDIA, AMD, Valve or ReShade. It distributes no game content: you need your own legally obtained copy of the game.

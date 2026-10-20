@@ -1,4 +1,6 @@
-/* NVIDIA DLSS (DLAA) for the D3D12 backend. See rsx_dlss.h for what the backend hands over and the env switches.
+/* Temporal upscaling for the D3D12 backend: NVIDIA DLSS (DLAA + upscaling, DLSS=1) or AMD FSR 3.1 / FSR 4 (FSR=1,
+ * through the AMD FSR API: FSR 4 on Radeon RX 7000 / 9000, FSR 3.1 on every other GPU). Both get the same inputs from
+ * here; see rsx_dlss.h for what the backend hands over and the env switches.
  *
  * Per presented gameplay frame:
  *   1. copy the finished back buffer into colour_in (DLSS needs a shader-readable input),
@@ -18,10 +20,20 @@
 #include <string>
 #include <vector>
 
+#ifdef PS3RECOMP_NGX
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_defs.h"
 #include "nvsdk_ngx_params.h"
 #include "nvsdk_ngx_helpers_d3d.h"
+#endif
+#ifdef PS3RECOMP_FFX
+#include "api/include/ffx_api.h"
+#include "api/include/dx12/ffx_api_dx12.h"
+#include "upscalers/include/ffx_upscale.h"
+#include "framegeneration/include/ffx_framegeneration.h"
+#include "framegeneration/include/dx12/ffx_api_framegeneration_dx12.h"
+#include <dxgi1_6.h>
+#endif
 #include "rsx_dlss.h"
 
 #pragma comment(lib, "d3d12.lib")
@@ -37,12 +49,21 @@ struct Cfg {
     float mipbias = -1.0f, jsign = 1.0f;
     int mipbias_set = 0;     /* DLSS_MIPBIAS given (else log2(render / output) - 1) */
     int preset = 0;          /* NVSDK_NGX_DLSS_Hint_Render_Preset value, 0 = default */
+    int backend = 0;         /* 0 NVIDIA DLSS (NGX), 1 AMD FSR (FSR API) */
+    float fsr_sharp = 0.0f;  /* FSR_SHARPNESS: FSR's own sharpening (RCAS), 0 off .. 1 */
+    char fsr_ver[16] = {0};  /* FSR_VERSION: pick the FSR provider whose name contains this ("3.1", "4"), else the best */
+    int fg = 0;              /* FSR_FG=1: AMD FSR frame generation (with DLSS or FSR upscaling) */
 };
-/* share of the output size each DLSS_MODE renders at (NVIDIA's ratios) */
+/* share of the output size each mode renders at: NVIDIA's ratios (DLSS_MODE) and AMD's (FSR_MODE: 1.5x/1.7x/2x/3x) */
 const float kModeRatio[5] = { 1.0f, 0.6667f, 0.58f, 0.5f, 0.3333f };
 const char* const kModeName[5] = { "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance" };
+const float kFsrRatio[5] = { 1.0f, 1.0f / 1.5f, 1.0f / 1.7f, 0.5f, 1.0f / 3.0f };
+const char* const kFsrName[5] = { "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance" };
 Cfg g;
 int g_cfg_loaded = 0;
+inline float ratio_of(int m) { return g.backend ? kFsrRatio[m] : kModeRatio[m]; }
+inline const char* name_of(int m) { return g.backend ? kFsrName[m] : kModeName[m]; }
+#define TAG (g.backend ? "[FSR]" : "[DLSS]")
 
 void cfg_load()
 {
@@ -71,13 +92,79 @@ void cfg_load()
         const char c = (char)toupper((unsigned char)*e);
         if (c >= 'A' && c <= 'O') g.preset = c - 'A' + 1;   /* A = 1 ... K = 11 (nvsdk_ngx_defs.h) */
     }
+    e = getenv("FSR");
+    if (e && *e && *e != '0' && _stricmp(e, "off") != 0) {
+        g.mode = 1; g.backend = 1; g.up = 0;
+        if ((e = getenv("FSR_MODE")) && *e) {
+            if (!_stricmp(e, "quality")) g.up = 1;
+            else if (!_stricmp(e, "balanced")) g.up = 2;
+            else if (!_stricmp(e, "performance")) g.up = 3;
+            else if (!_stricmp(e, "ultra") || !_stricmp(e, "ultraperformance")) g.up = 4;
+        }
+        if ((e = getenv("FSR_SHARPNESS")) && *e) { g.fsr_sharp = (float)atof(e); if (g.fsr_sharp < 0) g.fsr_sharp = 0; if (g.fsr_sharp > 1) g.fsr_sharp = 1; }
+        if ((e = getenv("FSR_VERSION")) && *e) { strncpy(g.fsr_ver, e, sizeof g.fsr_ver - 1); }
+    }
+    if ((e = getenv("FSR_FG")) && *e && *e != '0' && _stricmp(e, "off") != 0) g.fg = 1;
 }
 
 /* ---------------------------------------------------------------- NGX state */
 ID3D12Device* s_dev = nullptr;
-int s_ngx_ok = 0, s_failed = 0;
+int s_ngx_ok = 0, s_ffx_ok = 0, s_failed = 0;
+#ifdef PS3RECOMP_NGX
 NVSDK_NGX_Parameter* s_params = nullptr;
 NVSDK_NGX_Handle* s_feature = nullptr;
+#endif
+#ifdef PS3RECOMP_FFX
+/* AMD FSR API (amd_fidelityfx_loader_dx12.dll, loaded at run time; it loads amd_fidelityfx_upscaler_dx12.dll) */
+PfnFfxCreateContext p_ffxCreate = nullptr;
+PfnFfxDestroyContext p_ffxDestroy = nullptr;
+PfnFfxQuery p_ffxQuery = nullptr;
+PfnFfxDispatch p_ffxDispatch = nullptr;
+PfnFfxConfigure p_ffxConfigure = nullptr;
+ffxContext s_ffx = nullptr;
+/* frame generation: AMD's swap chain proxy (wraps the port's swap chain) + the generation context */
+ffxContext s_fg_sc = nullptr, s_fg = nullptr;
+IDXGISwapChain4* s_fg_swap = nullptr;
+ID3D12Resource* s_hudless = nullptr;        /* this frame's upscaled image before the HUD went on (output size) */
+D3D12_RESOURCE_STATES s_hudless_st = D3D12_RESOURCE_STATE_COPY_DEST;
+int s_hudless_ok = 0;                       /* s_hudless holds this frame's HUD-less image */
+uint64_t s_fg_frame = 0;
+float s_cam_pos[3] = {0, 0, 0};             /* the camera's position, summed from its per-frame moves */
+const char* s_fg_provider = "?";
+
+/* amd_fidelityfx_loader_dx12.dll next to the exe, else in ..\\..\\fsr-sdk\\Kits\\FidelityFX\\signedbin (FSR_DLL_DIR overrides). That
+ * folder also goes on the DLL search path: the loader loads the effect DLLs by name. */
+int ffx_load()
+{
+    static int done = 0, ok = 0;
+    if (done) return ok;
+    done = 1;
+    wchar_t exe_dir[MAX_PATH], dir[MAX_PATH], path[MAX_PATH + 64];
+    GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
+    if (wchar_t* sl = wcsrchr(exe_dir, L'\\')) *sl = 0;
+    const char* fd = getenv("FSR_DLL_DIR");
+    if (fd && *fd) MultiByteToWideChar(CP_ACP, 0, fd, -1, dir, MAX_PATH);
+    else _snwprintf(dir, MAX_PATH, L"%ls\\..\\..\\fsr-sdk\\Kits\\FidelityFX\\signedbin", exe_dir);
+    HMODULE h = nullptr;
+    _snwprintf(path, MAX_PATH + 64, L"%ls\\amd_fidelityfx_loader_dx12.dll", exe_dir);
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) h = LoadLibraryW(path);
+    if (!h) {
+        SetDllDirectoryW(dir);
+        _snwprintf(path, MAX_PATH + 64, L"%ls\\amd_fidelityfx_loader_dx12.dll", dir);
+        h = LoadLibraryW(path);
+    }
+    if (h) {
+        p_ffxCreate = (PfnFfxCreateContext)(void*)GetProcAddress(h, "ffxCreateContext");
+        p_ffxDestroy = (PfnFfxDestroyContext)(void*)GetProcAddress(h, "ffxDestroyContext");
+        p_ffxQuery = (PfnFfxQuery)(void*)GetProcAddress(h, "ffxQuery");
+        p_ffxDispatch = (PfnFfxDispatch)(void*)GetProcAddress(h, "ffxDispatch");
+        p_ffxConfigure = (PfnFfxConfigure)(void*)GetProcAddress(h, "ffxConfigure");
+    }
+    ok = h && p_ffxCreate && p_ffxDestroy && p_ffxQuery && p_ffxDispatch && p_ffxConfigure;
+    if (!ok) fprintf(stderr, "[FSR] amd_fidelityfx_loader_dx12.dll not found or incomplete (next to the exe or in %ls)%c", dir, 10);
+    return ok;
+}
+#endif
 uint32_t s_feat_w = 0, s_feat_h = 0;
 uint32_t s_render_w = 0, s_render_h = 0;   /* the size the game renders at */
 uint32_t s_out_w = 0, s_out_h = 0;         /* the size DLSS writes (the backbuffer); larger when upscaling */
@@ -86,7 +173,7 @@ inline bool upscaling() { return s_out_w != s_render_w || s_out_h != s_render_h;
 
 void fail(const char* what, long long code)
 {
-    fprintf(stderr, "[DLSS] %s failed (0x%llX) -- DLSS off for this run%c", what, (unsigned long long)code, 10);
+    fprintf(stderr, "%s %s failed (0x%llX) -- %s off for this run%c", TAG, what, (unsigned long long)code, g.backend ? "FSR" : "DLSS", 10);
     s_failed = 1;
 }
 
@@ -571,10 +658,72 @@ int invert4(const float* m, float* o)
     return 1;
 }
 
-/* The DLSS feature: render size in, output size out. Quality mode = the user's DLSS_MODE when upscaling, else DLAA
- * (also when upscaling was asked for but the render size ended up equal to the output, e.g. clamped at 720p). */
+/* The upscaler: render size in, output size out. Quality mode = the user's DLSS_MODE / FSR_MODE when upscaling, else
+ * DLAA / Native AA (also when upscaling was asked for but the render size ended up equal to the output, e.g. clamped
+ * at 720p). */
 int s_feat_mode = 0;
-int create_feature(ID3D12GraphicsCommandList* cl)
+#ifdef PS3RECOMP_FFX
+void ffx_message(uint32_t type, const wchar_t* m)
+{
+    static int n = 0;
+    if (n++ < 40) fprintf(stderr, "[FSR] %s: %ls%c", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", m, 10);
+}
+const char* s_ffx_provider = "?";
+int ffx_create()
+{
+    const int mode = upscaling() ? (g.up ? g.up : 1) : 0;
+    if (s_ffx && s_feat_w == s_render_w && s_feat_h == s_render_h && s_feat_mode == mode) return 1;
+    if (s_ffx) { p_ffxDestroy(&s_ffx, nullptr); s_ffx = nullptr; }
+    ffxCreateBackendDX12Desc be = {};
+    be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12; be.device = s_dev;
+    ffxCreateContextDescUpscaleVersion ver = {};
+    ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION; ver.version = FFX_UPSCALER_VERSION;
+    ver.header.pNext = &be.header;
+    ffxCreateContextDescUpscale cd = {};
+    cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE; cd.header.pNext = &ver.header;
+    /* the game's colour is the finished, tone-mapped 8-bit image; depth is standard (0 near, 1 far) */
+    cd.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    cd.maxRenderSize.width = s_render_w; cd.maxRenderSize.height = s_render_h;
+    cd.maxUpscaleSize.width = s_out_w; cd.maxUpscaleSize.height = s_out_h;
+    cd.fpMessage = ffx_message;
+    /* FSR_VERSION: a specific provider (by name, e.g. "3.1"), otherwise the loader's best one for this GPU */
+    ffxOverrideVersion ov = {};
+    {
+        uint64_t cnt = 0;
+        ffxQueryDescGetVersions q = {};
+        q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS; q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        q.device = s_dev; q.outputCount = &cnt;
+        if (p_ffxQuery(nullptr, &q.header) == FFX_API_RETURN_OK && cnt > 0 && cnt < 32) {
+            uint64_t ids[32] = {0}; const char* names[32] = {0};
+            q.versionIds = ids; q.versionNames = names;
+            if (p_ffxQuery(nullptr, &q.header) == FFX_API_RETURN_OK) {
+                static int logged = 0;
+                for (uint64_t i = 0; i < cnt && !logged; i++) fprintf(stderr, "[FSR] provider %llu: %s%c", (unsigned long long)i, names[i] ? names[i] : "?", 10);
+                logged = 1;
+                if (g.fsr_ver[0])
+                    for (uint64_t i = 0; i < cnt; i++)
+                        if (names[i] && strstr(names[i], g.fsr_ver)) {
+                            ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION; ov.versionId = ids[i];
+                            ov.header.pNext = cd.header.pNext; cd.header.pNext = &ov.header;
+                            fprintf(stderr, "[FSR] FSR_VERSION=%s: using %s%c", g.fsr_ver, names[i], 10);
+                            break;
+                        }
+            }
+        }
+    }
+    const ffxReturnCode_t r = p_ffxCreate(&s_ffx, &cd.header, nullptr);
+    if (r != FFX_API_RETURN_OK || !s_ffx) { fail("FSR context creation", r); s_ffx = nullptr; return 0; }
+    ffxQueryGetProviderVersion pv = {};
+    pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    if (p_ffxQuery(&s_ffx, &pv.header) == FFX_API_RETURN_OK && pv.versionName) s_ffx_provider = pv.versionName;
+    s_feat_w = s_render_w; s_feat_h = s_render_h; s_feat_mode = mode;
+    fprintf(stderr, "[FSR] %s %ux%u -> %ux%u created (provider %s, sharpening %.2f)%c", kFsrName[mode], s_render_w, s_render_h,
+            s_out_w, s_out_h, s_ffx_provider, g.fsr_sharp, 10);
+    return 1;
+}
+#endif
+#ifdef PS3RECOMP_NGX
+int ngx_create(ID3D12GraphicsCommandList* cl)
 {
     const int mode = upscaling() ? (g.up ? g.up : 1) : 0;
     if (s_feature && s_feat_w == s_render_w && s_feat_h == s_render_h && s_feat_mode == mode) return 1;
@@ -600,6 +749,34 @@ int create_feature(ID3D12GraphicsCommandList* cl)
             s_out_w, s_out_h, g.preset ? "set" : "default", 10);
     return 1;
 }
+#endif
+int create_feature(ID3D12GraphicsCommandList* cl)
+{
+#ifdef PS3RECOMP_FFX
+    if (g.backend) return ffx_create();
+#endif
+#ifdef PS3RECOMP_NGX
+    if (!g.backend) return ngx_create(cl);
+#endif
+    (void)cl;
+    return 0;
+}
+
+/* FSR also wants the camera's near / far planes and vertical field of view. The camera matrix (camera-relative world
+ * -> D3D clip, row-major) is projection x rotation: its w row is the unit view direction (times w's scale), its z row
+ * a * w-direction + b, its y row the vertical focal length. depth = (a d + b) / (lw d) -> 0 at near, 1 at far. */
+void cam_planes(const float* m, float* nearp, float* farp, float* fov)
+{
+    const float lw = sqrtf(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
+    const float ly = sqrtf(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+    if (lw < 1e-6f || ly < 1e-6f) return;
+    const float a = (m[8] * m[12] + m[9] * m[13] + m[10] * m[14]) / lw, b = m[11];
+    if (fabsf(a) > 1e-9f && fabsf(lw - a) > 1e-9f) {
+        const float n = -b / a, f = b / (lw - a);
+        if (n > 0.0f && f > n) { *nearp = n; *farp = f; }
+    }
+    *fov = 2.0f * atanf(lw / ly);
+}
 
 } // namespace
 
@@ -609,7 +786,7 @@ extern "C" {
 float rsx_dlss_render_ratio(void)
 {
     cfg_load();
-    return (g.mode && g.up > 0 && g.up < 5) ? kModeRatio[g.up] : 1.0f;
+    return (g.mode && g.up > 0 && g.up < 5) ? ratio_of(g.up) : 1.0f;
 }
 
 void rsx_dlss_device_init(ID3D12Device* dev, uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h)
@@ -624,8 +801,26 @@ void rsx_dlss_device_init(ID3D12Device* dev, uint32_t render_w, uint32_t render_
         s_jphases = ph > 64.0f ? 64u : ph < 16.0f ? 16u : (uint32_t)ceilf(ph);
     }
     if (g.probe) { s_pskip = g.probe; fprintf(stderr, "[DLSS] probe armed: frame after %d gameplay frames%c", g.probe, 10); }
-    if (!g.mode || !dev || s_ngx_ok || s_failed) return;
+    if (!g.mode || !dev || s_ngx_ok || s_ffx_ok || s_failed) return;
     s_dev = dev;
+    if (g.backend) {
+#ifdef PS3RECOMP_FFX
+        if (!ffx_load()) { fprintf(stderr, "[FSR] -- off%c", 10); s_failed = 1; return; }
+        s_ffx_ok = 1;
+        fprintf(stderr, "[FSR] ready: %s, render %ux%u -> output %ux%u, jitter %s (%u phases), motion vectors %s, mip bias %+.2f%c",
+                kFsrName[upscaling() ? (g.up ? g.up : 1) : 0], s_render_w, s_render_h, s_out_w, s_out_h,
+                g.jitter ? "on" : "off", s_jphases, g.mv ? "on" : "off", g.mipbias, 10);
+#else
+        fprintf(stderr, "[FSR] FSR=1, but this build has no AMD FSR (no fsr-sdk folder at build time) -- off%c", 10);
+        s_failed = 1;
+#endif
+        return;
+    }
+#ifndef PS3RECOMP_NGX
+    fprintf(stderr, "[DLSS] DLSS=1, but this build has no NVIDIA DLSS (no dlss-sdk folder at build time) -- off%c", 10);
+    s_failed = 1;
+    return;
+#else
     /* NGX logs + scratch next to the game (cwd = infamous-recomp); the DLSS model DLL is looked up next to the
      * exe and in ..\..\dlss-sdk\lib\Windows_x86_64\rel (DLSS_DLL_DIR overrides). */
     static wchar_t data_dir[MAX_PATH], dll_dir[MAX_PATH], exe_dir[MAX_PATH];
@@ -658,9 +853,10 @@ void rsx_dlss_device_init(ID3D12Device* dev, uint32_t render_w, uint32_t render_
     fprintf(stderr, "[DLSS] NGX ready: %s, render %ux%u -> output %ux%u, jitter %s (%u phases), motion vectors %s, mip bias %+.2f%c",
             kModeName[upscaling() ? (g.up ? g.up : 1) : 0], s_render_w, s_render_h, s_out_w, s_out_h,
             g.jitter ? "on" : "off", s_jphases, g.mv ? "on" : "off", g.mipbias, 10);
+#endif
 }
 
-int rsx_dlss_active(void) { return s_ngx_ok && !s_failed; }
+int rsx_dlss_active(void) { return (s_ngx_ok || s_ffx_ok) && !s_failed; }
 int rsx_dlss_upscaling(void) { return rsx_dlss_active() && upscaling(); }
 int rsx_dlss_probe_on(void) { cfg_load(); return g.probe && s_pstate < 2; }
 float rsx_dlss_mip_bias(void) { cfg_load(); return (g.mode && !s_failed) ? g.mipbias : 0.0f; }
@@ -790,6 +986,7 @@ void rsx_dlss_capture_depth(ID3D12GraphicsCommandList* cl, ID3D12Resource* z, ui
 
 namespace {
 int s_hist_ok = 0;   /* DLSS history belongs to an unbroken run of gameplay frames */
+int s_last_reset = 1; float s_last_dt = 16.6f;   /* this frame's upscaler reset flag and frame time, for frame generation */
 
 void bind_compute(ID3D12GraphicsCommandList* cl, const float* k)
 {
@@ -911,26 +1108,80 @@ int dlss_frame(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb)
     barrier(cl, s_mv, s_mv_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(cl, s_dz, s_dz_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    /* 3. DLSS: render size in, output size out */
+    /* 3. the upscaler (DLSS or FSR): render size in, output size out. Both take motion vectors in render pixels,
+     *    pointing from this frame to the last one, and the jitter in pixels as applied to the projection. */
     barrier(cl, s_out, s_out_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-    ep.Feature.pInColor = s_in; ep.Feature.pInOutput = s_out;
-    ep.pInDepth = s_dz; ep.pInMotionVectors = s_mv;
-    ep.InJitterOffsetX = g.jsign * s_exec.jx; ep.InJitterOffsetY = g.jsign * s_exec.jy;
-    ep.InRenderSubrectDimensions.Width = w; ep.InRenderSubrectDimensions.Height = h;
-    ep.InReset = (s_hist_ok && !cut) ? 0 : 1;   /* new run of gameplay frames, or a camera cut */
-    ep.InMVScaleX = 1.0f; ep.InMVScaleY = 1.0f;
+    const int reset = (s_hist_ok && !cut) ? 0 : 1;   /* new run of gameplay frames, or a camera cut */
+    float dt_ms;
     {   static LARGE_INTEGER f, t0; LARGE_INTEGER t; QueryPerformanceCounter(&t);
         if (!f.QuadPart) QueryPerformanceFrequency(&f);
-        ep.InFrameTimeDeltaInMsec = t0.QuadPart ? (float)((double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart) : 16.6f;
+        dt_ms = t0.QuadPart ? (float)((double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart) : 16.6f;
         t0 = t; }
-    NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(cl, s_feature, s_params, &ep);
-    if (NVSDK_NGX_FAILED(r)) {
-        static int n = 0; if (n++ < 5) fprintf(stderr, "[DLSS] evaluate failed (0x%X)%c", (unsigned)r, 10);
-        s_hist_ok = 0;
-        return 0;
+#ifdef PS3RECOMP_FFX
+    if (g.backend) {
+        float nearp = 10.0f, farp = 100000.0f, fov = 1.0f;
+        if (s_exec.cam_valid) cam_planes(s_exec.cam, &nearp, &farp, &fov);
+        { static int n = 0; if (n++ == 0) fprintf(stderr, "[FSR] camera: near %.3f, far %.1f, vertical fov %.1f deg%c", nearp, farp, fov * 57.29578f, 10); }
+        ffxDispatchDescUpscale d = {};
+        d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+        d.commandList = cl;
+        d.color = ffxApiGetResourceDX12(s_in, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        d.depth = ffxApiGetResourceDX12(s_dz, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        d.motionVectors = ffxApiGetResourceDX12(s_mv, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        d.output = ffxApiGetResourceDX12(s_out, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        d.jitterOffset.x = g.jsign * s_exec.jx; d.jitterOffset.y = g.jsign * s_exec.jy;
+        d.motionVectorScale.x = 1.0f; d.motionVectorScale.y = 1.0f;
+        d.renderSize.width = w; d.renderSize.height = h;
+        d.upscaleSize.width = ow; d.upscaleSize.height = oh;
+        d.enableSharpening = g.fsr_sharp > 0.0f; d.sharpness = g.fsr_sharp;
+        d.frameTimeDelta = dt_ms; d.preExposure = 1.0f; d.reset = reset != 0;
+        d.cameraNear = nearp; d.cameraFar = farp; d.cameraFovAngleVertical = fov;
+        d.viewSpaceToMetersFactor = 0.01f;   /* the game works in centimetres */
+        d.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+        const ffxReturnCode_t r = p_ffxDispatch(&s_ffx, &d.header);
+        if (r != FFX_API_RETURN_OK) {
+            static int n = 0; if (n++ < 5) fprintf(stderr, "[FSR] dispatch failed (%u)%c", (unsigned)r, 10);
+            s_hist_ok = 0;
+            return 0;
+        }
     }
-    if (merge || g.debug_mv) bind_compute(cl, k);   /* NGX left its own heaps and state on the list */
+#endif
+#ifdef PS3RECOMP_NGX
+    if (!g.backend) {
+        NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+        ep.Feature.pInColor = s_in; ep.Feature.pInOutput = s_out;
+        ep.pInDepth = s_dz; ep.pInMotionVectors = s_mv;
+        ep.InJitterOffsetX = g.jsign * s_exec.jx; ep.InJitterOffsetY = g.jsign * s_exec.jy;
+        ep.InRenderSubrectDimensions.Width = w; ep.InRenderSubrectDimensions.Height = h;
+        ep.InReset = reset;
+        ep.InMVScaleX = 1.0f; ep.InMVScaleY = 1.0f;
+        ep.InFrameTimeDeltaInMsec = dt_ms;
+        NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(cl, s_feature, s_params, &ep);
+        if (NVSDK_NGX_FAILED(r)) {
+            static int n = 0; if (n++ < 5) fprintf(stderr, "[DLSS] evaluate failed (0x%X)%c", (unsigned)r, 10);
+            s_hist_ok = 0;
+            return 0;
+        }
+    }
+#endif
+#ifdef PS3RECOMP_FFX
+    s_hudless_ok = 0;
+    if (s_fg && merge) {   /* frame generation: the upscaled image before the HUD, so it can keep the HUD undistorted */
+        if (!s_hudless) {
+            s_hudless = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, ow, oh, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            s_hudless_st = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+        if (s_hudless) {
+            barrier(cl, s_out, s_out_st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(cl, s_hudless, s_hudless_st, D3D12_RESOURCE_STATE_COPY_DEST);
+            cl->CopyResource(s_hudless, s_out);
+            barrier(cl, s_hudless, s_hudless_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barrier(cl, s_out, s_out_st, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            s_hudless_ok = 1;
+        }
+    }
+#endif
+    if (merge || g.debug_mv) bind_compute(cl, k);   /* the upscaler left its own heaps and state on the list */
     if (merge) {   /* 3b. the HUD back on top (output size; enlarged smoothly when upscaling) */
         cl->SetPipelineState(s_pso_merge);
         uav_barrier(cl, s_out);
@@ -956,17 +1207,143 @@ int dlss_frame(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb)
     barrier(cl, s_dz, s_dz_st, D3D12_RESOURCE_STATE_COPY_SOURCE);
     cl->CopyResource(s_pdz, s_dz);
     s_prev_jx = s_exec.jx; s_prev_jy = s_exec.jy;
+    s_last_reset = reset; s_last_dt = dt_ms;
 
     /* 4. out -> back buffer */
     out_to_backbuffer(cl, bb);
 
     if (s_exec.cam_valid) { memcpy(s_prev_cam, s_exec.cam, 64); s_prev_cam_valid = 1; } else s_prev_cam_valid = 0;
     s_hist_ok = 1;
-    { static int n = 0; if (n++ == 0) fprintf(stderr, "[DLSS] first %s frame (%u jittered draws, depth 0x%X, %ux%u -> %ux%u)%c",
-                                              kModeName[s_feat_mode], s_exec.qualifying, s_exec.zeta, w, h, ow, oh, 10); }
+    { static int n = 0; if (n++ == 0) fprintf(stderr, "%s first %s frame (%u jittered draws, depth 0x%X, %ux%u -> %ux%u)%c",
+                                              TAG, name_of(s_feat_mode), s_exec.qualifying, s_exec.zeta, w, h, ow, oh, 10); }
     return 1;
 }
 } // namespace
+
+#ifdef PS3RECOMP_FFX
+namespace {
+ffxReturnCode_t fg_dispatch(ffxDispatchDescFrameGeneration* params, void* ctx)
+{
+    return p_ffxDispatch((ffxContext*)ctx, &params->header);
+}
+
+/* Once per presented frame, before Present: frame generation runs for gameplay frames the upscaler handled (it has
+ * their depth and motion vectors), and is off for menus, loading screens and videos. */
+void fg_frame(ID3D12GraphicsCommandList* cl, int ran)
+{
+    if (!s_fg || !s_fg_swap) return;
+    s_fg_frame++;
+    const int on = ran && s_dz && s_mv;
+    ffxConfigureDescFrameGeneration c = {};
+    c.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    c.swapChain = s_fg_swap;
+    c.frameGenerationCallback = fg_dispatch; c.frameGenerationCallbackUserContext = &s_fg;
+    c.frameGenerationEnabled = on != 0;
+    c.allowAsyncWorkloads = false;
+    if (on && s_hudless_ok) c.HUDLessColor = ffxApiGetResourceDX12(s_hudless, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    c.generationRect.left = 0; c.generationRect.top = 0; c.generationRect.width = (int32_t)s_out_w; c.generationRect.height = (int32_t)s_out_h;
+    c.frameID = s_fg_frame;
+    ffxReturnCode_t r = p_ffxConfigure(&s_fg, &c.header);
+    if (r != FFX_API_RETURN_OK) { static int n = 0; if (n++ < 5) fprintf(stderr, "[FSR] frame generation configure failed (%u)%c", (unsigned)r, 10); return; }
+    if (!on) return;
+
+    /* the generation inputs: this frame's depth and motion vectors (render size), jitter and camera */
+    barrier(cl, s_dz, s_dz_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(cl, s_mv, s_mv_st, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    float nearp = 10.0f, farp = 100000.0f, fov = 1.0f;
+    if (s_exec.cam_valid) cam_planes(s_exec.cam, &nearp, &farp, &fov);
+    if (s_exec.delta_valid) for (int i = 0; i < 3; i++) s_cam_pos[i] += s_exec.delta[i];
+    ffxDispatchDescFrameGenerationPrepareV2 d = {};
+    d.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+    d.frameID = s_fg_frame; d.flags = 0; d.commandList = cl;
+    d.renderSize.width = s_render_w; d.renderSize.height = s_render_h;
+    d.jitterOffset.x = g.jsign * s_exec.jx; d.jitterOffset.y = g.jsign * s_exec.jy;
+    d.motionVectorScale.x = 1.0f; d.motionVectorScale.y = 1.0f;
+    d.frameTimeDelta = s_last_dt; d.reset = s_last_reset != 0;
+    d.cameraNear = nearp; d.cameraFar = farp; d.cameraFovAngleVertical = fov; d.viewSpaceToMetersFactor = 0.01f;
+    d.depth = ffxApiGetResourceDX12(s_dz, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    d.motionVectors = ffxApiGetResourceDX12(s_mv, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    if (s_exec.cam_valid) {   /* camera axes from the camera matrix rows (right, up, forward), position from its moves */
+        const float* m = s_exec.cam;
+        const float* rows[3] = { m, m + 4, m + 12 };
+        float* outs[3] = { d.cameraRight, d.cameraUp, d.cameraForward };
+        for (int k = 0; k < 3; k++) {
+            const float l = sqrtf(rows[k][0] * rows[k][0] + rows[k][1] * rows[k][1] + rows[k][2] * rows[k][2]);
+            for (int i = 0; i < 3; i++) outs[k][i] = l > 1e-9f ? rows[k][i] / l : 0.0f;
+        }
+        for (int i = 0; i < 3; i++) d.cameraPosition[i] = s_cam_pos[i];
+    }
+    r = p_ffxDispatch(&s_fg, &d.header);
+    if (r != FFX_API_RETURN_OK) { static int n = 0; if (n++ < 5) fprintf(stderr, "[FSR] frame generation prepare failed (%u)%c", (unsigned)r, 10); }
+    { static int n = 0; if (n++ == 0) fprintf(stderr, "[FSR] frame generation running (%s, HUD-less image %s)%c", s_fg_provider, s_hudless_ok ? "yes" : "no", 10); }
+}
+} // namespace
+#endif
+
+/* FSR_FG=1: right after the port created its swap chain (before it takes the back buffers), replace it with AMD's
+ * frame generation swap chain and create the generation context. *swap3 is the port's IDXGISwapChain3 and must be
+ * its only reference: AMD's proxy releases it and makes a new swap chain on the same window. Returns 1 when the
+ * swap chain was replaced (*swap3 is then the proxy). */
+extern "C" int rsx_dlss_wrap_swapchain(void** swap3, ID3D12CommandQueue* queue)
+{
+    cfg_load();
+#ifdef PS3RECOMP_FFX
+    if (!g.fg) return 0;
+    if (!rsx_dlss_active()) { fprintf(stderr, "[FSR] frame generation needs DLSS or FSR on (their depth and motion vectors) -- off%c", 10); return 0; }
+    if (!swap3 || !*swap3 || !queue || !ffx_load()) return 0;
+    IDXGISwapChain3* sc3 = (IDXGISwapChain3*)*swap3;
+    IDXGISwapChain4* sc4 = nullptr;
+    if (FAILED(sc3->QueryInterface(IID_PPV_ARGS(&sc4))) || !sc4) return 0;
+    sc3->Release();   /* sc4 now holds the only reference */
+    *swap3 = nullptr;
+    ffxCreateContextDescFrameGenerationSwapChainVersionDX12 v = {};
+    v.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_DX12;
+    v.version = FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION;
+    ffxCreateContextDescFrameGenerationSwapChainWrapDX12 w = {};
+    w.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12; w.header.pNext = &v.header;
+    w.swapchain = &sc4; w.gameQueue = queue;
+    ffxReturnCode_t r = p_ffxCreate(&s_fg_sc, &w.header, nullptr);
+    int wrapped = r == FFX_API_RETURN_OK && sc4;
+    if (!wrapped) fprintf(stderr, "[FSR] frame generation swap chain failed (%u) -- frame generation off%c", (unsigned)r, 10);
+    if (!sc4) return -1;   /* no swap chain left at all */
+    IDXGISwapChain3* out = nullptr;
+    if (FAILED(sc4->QueryInterface(IID_PPV_ARGS(&out))) || !out) { sc4->Release(); return -1; }
+    *swap3 = out;
+    if (!wrapped) { sc4->Release(); s_fg_sc = nullptr; return 0; }
+    s_fg_swap = sc4;   /* kept for ffxConfigure (one reference) */
+
+    ffxCreateBackendDX12Desc be = {};
+    be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12; be.device = s_dev;
+    ffxCreateContextDescFrameGenerationVersion fv = {};
+    fv.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION; fv.version = FFX_FRAMEGENERATION_VERSION;
+    fv.header.pNext = &be.header;
+    ffxCreateContextDescFrameGenerationHudless hl = {};
+    hl.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_HUDLESS; hl.hudlessBackBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+    hl.header.pNext = &fv.header;
+    ffxCreateContextDescFrameGeneration fd = {};
+    fd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION; fd.header.pNext = &hl.header;
+    fd.flags = 0;
+    fd.displaySize.width = s_out_w; fd.displaySize.height = s_out_h;
+    fd.maxRenderSize.width = s_render_w; fd.maxRenderSize.height = s_render_h;
+    fd.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+    r = p_ffxCreate(&s_fg, &fd.header, nullptr);
+    if (r != FFX_API_RETURN_OK || !s_fg) {
+        fprintf(stderr, "[FSR] frame generation context failed (%u) -- the swap chain stays, generation off%c", (unsigned)r, 10);
+        s_fg = nullptr;
+        return 1;
+    }
+    ffxQueryGetProviderVersion pv = {};
+    pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    if (p_ffxQuery(&s_fg, &pv.header) == FFX_API_RETURN_OK && pv.versionName) s_fg_provider = pv.versionName;
+    fprintf(stderr, "[FSR] frame generation ready: provider %s, %ux%u output, render up to %ux%u%c", s_fg_provider, s_out_w, s_out_h,
+            s_render_w, s_render_h, 10);
+    return 1;
+#else
+    (void)swap3; (void)queue;
+    if (g.fg) fprintf(stderr, "[FSR] FSR_FG=1, but this build has no AMD FSR (no fsr-sdk folder at build time) -- off%c", 10);
+    return 0;
+#endif
+}
 
 extern "C" void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource* bb, uint32_t w, uint32_t h,
                                    ID3D12Resource* zeta, uint32_t zeta_state)
@@ -977,6 +1354,10 @@ extern "C" void rsx_dlss_frame_end(ID3D12GraphicsCommandList* cl, ID3D12Resource
         static int n = 0; if (n++ < 3) fprintf(stderr, "[DLSS] backbuffer %ux%u is not the output size %ux%u -- skipped%c", w, h, s_out_w, s_out_h, 10);
         return;
     }
-    if (!dlss_frame(cl, bb) && upscaling()) upscale_fallback(cl, bb);   /* the backbuffer always gets the frame */
+    const int ran = dlss_frame(cl, bb);
+    if (!ran && upscaling()) upscale_fallback(cl, bb);   /* the backbuffer always gets the frame */
     s_fsnap = 0;
+#ifdef PS3RECOMP_FFX
+    fg_frame(cl, ran);
+#endif
 }

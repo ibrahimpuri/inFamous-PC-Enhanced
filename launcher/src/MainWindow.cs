@@ -490,7 +490,9 @@ namespace InfamousLauncher
             parts.Add(Label(fs, M.Get(fs)).Replace(" (borderless)", ""));
             string c = M.Get(cap);
             parts.Add(c == "0" ? "uncapped" : Label(cap, c).Replace(" (PS3)", ""));
-            if (Inv.Same(M.Get("DLSS"), "1")) { var dm = Catalog.Find("DLSS_MODE"); parts.Add("DLSS " + Label(dm, M.Get(dm)).Split('·')[0].Trim()); }
+            if (Inv.Same(M.Get("FSR"), "1")) { var fm = Catalog.Find("FSR_MODE"); parts.Add("FSR " + Label(fm, M.Get(fm)).Split('·')[0].Trim()); }
+            else if (Inv.Same(M.Get("DLSS"), "1")) { var dm = Catalog.Find("DLSS_MODE"); parts.Add("DLSS " + Label(dm, M.Get(dm)).Split('·')[0].Trim()); }
+            if (Inv.Same(M.Get("FSR_FG"), "1") && (Inv.Same(M.Get("FSR"), "1") || Inv.Same(M.Get("DLSS"), "1"))) parts.Add("frame generation");
             if (M.Cfg.LowCpu == "1") parts.Add("low-end CPU mode");
             if (ReShadeSetup.Wanted(M)) parts.Add(ReShadeSetup.OwnPreset(M) ? "ReShade" : "ReShade " + ReShadeSetup.LookName(M));
             int mods = M.EnabledMods.Count();

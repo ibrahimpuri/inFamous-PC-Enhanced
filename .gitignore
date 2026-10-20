@@ -64,6 +64,7 @@ launcher/reshade/*.dll
 launcher/reshade/*.new
 launcher/reshade/*.exe
 dlss-sdk/
+fsr-sdk/
 save-backups/
 github/
 github-enhanced/

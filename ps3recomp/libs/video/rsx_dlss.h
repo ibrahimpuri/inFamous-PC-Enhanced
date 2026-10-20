@@ -1,7 +1,9 @@
-/* NVIDIA DLSS (DLAA) for the D3D12 backend -- rsx_dlss.cpp.
+/* Temporal upscaling for the D3D12 backend -- rsx_dlss.cpp: NVIDIA DLSS, or AMD FSR 3.1 / FSR 4 plus FSR frame
+ * generation.
  *
- * Built only when the DLSS SDK sits next to the checkout (dlss-sdk/, see CMakeLists.txt), which defines
- * PS3RECOMP_DLSS. Off unless DLSS=1 (the launcher's Graphics page sets it).
+ * Built when the DLSS SDK (dlss-sdk/, PS3RECOMP_NGX) and/or the AMD FSR SDK (fsr-sdk/, PS3RECOMP_FFX) sits next to the
+ * checkout (see CMakeLists.txt); either defines PS3RECOMP_DLSS. Off unless DLSS=1 or FSR=1 (the launcher's Graphics
+ * page sets them; FSR wins when both are set).
  *   DLSS_MODE=dlaa (default): the game renders at its normal internal resolution and DLSS replaces the aliased image
  *     with a temporally anti-aliased one of the same size.
  *   DLSS_MODE=quality | balanced | performance (| ultra): upscaling. The game renders at 67 / 58 / 50 (/ 33) % of the
@@ -28,6 +30,13 @@
  *      motion only (no zero-motion fallback for objects moving with the camera, e.g. Cole while running).
  *      DLSS_PROBE=<n>: write one gameplay frame's vertex-constant layout
  *      (dlss_probe.txt + dlss_probe_vs_*.hlsl in the working directory) after n gameplay frames.
+ *      FSR=1 AMD FSR instead: FSR 4 on Radeon RX 7000 / 9000, FSR 3.1 on other GPUs (AMD's loader picks).
+ *      FSR_MODE=native|quality|balanced|performance|ultra (1x, 1.5x, 1.7x, 2x, 3x). FSR_SHARPNESS=<0..1> FSR's own
+ *      sharpening (default 0, off). FSR_VERSION=<text> use the FSR provider whose name contains it (e.g. 3.1).
+ *      FSR_FG=1 AMD FSR frame generation (with DLSS or FSR upscaling on): the swap chain is wrapped in AMD's proxy,
+ *      which presents a generated frame between every two real ones; off on menus, loading screens and videos.
+ *      FSR_DLL_DIR=<dir> where amd_fidelityfx_loader_dx12.dll is (default: next to the exe, then
+ *      ..\..\fsr-sdk\Kits\FidelityFX\signedbin).
  */
 #ifndef RSX_DLSS_H
 #define RSX_DLSS_H
@@ -40,6 +49,7 @@ extern "C" {
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
+struct ID3D12CommandQueue;
 
 typedef struct rsx_dlss_draw_info {
     uint32_t frame;                 /* batch number being recorded (s_frame_no) */
@@ -66,6 +76,10 @@ int   rsx_dlss_active(void);
 int   rsx_dlss_upscaling(void);      /* active, and the output is larger than the render size */
 float rsx_dlss_mip_bias(void);       /* add to mipmapped samplers' LOD bias (0 when off) */
 int   rsx_dlss_probe_on(void);
+/* Right after the swap chain is created, before its buffers are taken: FSR_FG=1 replaces it (*swapchain3, the port's
+ * IDXGISwapChain3 and only reference to it) with AMD's frame generation swap chain. Returns 1 when replaced, 0 when
+ * not (the swap chain is unchanged), -1 when no swap chain is left. */
+int   rsx_dlss_wrap_swapchain(void** swapchain3, struct ID3D12CommandQueue* queue);
 
 /* Record time. qualifies: this draw rasterizes the main scene (gets the jitter). jitter_ndc: the jitter of the
  * frame being recorded, as an NDC offset for the viewport epilogue. */

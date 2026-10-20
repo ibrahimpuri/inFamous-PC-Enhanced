@@ -47,13 +47,18 @@ namespace InfamousLauncher
             }
         }
 
-        bool Cond(string expr)   // KEY=value, several joined with &
+        bool Cond(string expr)   // KEY=value; & joins conditions that must all hold, | alternatives of which one must
         {
             if (string.IsNullOrEmpty(expr)) return true;
             foreach (var part in expr.Split('&'))
             {
-                int eq = part.IndexOf('=');
-                if (!Inv.Same(M.Get(part.Substring(0, eq)), part.Substring(eq + 1))) return false;
+                bool any = false;
+                foreach (var alt in part.Split('|'))
+                {
+                    int eq = alt.IndexOf('=');
+                    if (Inv.Same(M.Get(alt.Substring(0, eq)), alt.Substring(eq + 1))) { any = true; break; }
+                }
+                if (!any) return false;
             }
             return true;
         }
@@ -248,7 +253,35 @@ namespace InfamousLauncher
 
         UIElement GraphicsPage()
         {
-            return SettingsPage("graphics", "Graphics", "Image quality and how far the city is drawn. Draw distance has the biggest effect on frame rate.", PresetSection());
+            return SettingsPage("graphics", "Graphics", "Image quality and how far the city is drawn. Draw distance has the biggest effect on frame rate.", GpuHint(), PresetSection());
+        }
+
+        // Graphics page, on a Radeon: suggest AMD FSR (FSR 4 on RX 7000 / 9000) with frame generation.
+        UIElement GpuHint()
+        {
+            string gpu = SystemInfo.Gpu ?? "";
+            if (gpu.IndexOf("Radeon", StringComparison.OrdinalIgnoreCase) < 0) return null;
+            if (Inv.Same(M.Get("FSR"), "1") && Inv.Same(M.Get("FSR_FG"), "1")) return null;
+            bool fsr4 = Regex.IsMatch(gpu, @"RX\s*[79]\d{3}", RegexOptions.IgnoreCase);
+            var g = new Grid { Margin = new Thickness(18, 14, 18, 14) };
+            g.ColumnDefinitions.Add(new ColumnDefinition());
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var text = VStack(T(gpu + (fsr4 ? ": FSR 4 available" : ": FSR 3.1 available"), 14, "Text", FontWeights.SemiBold),
+                              T("AMD FSR (Quality) with frame generation gives the smoothest picture on this card, most of all in crowded " +
+                                "streets, where the CPU sets the frame rate and frame generation doubles what you see.", 12.5, "Dim"));
+            text.Margin = new Thickness(0, 0, 14, 0);
+            g.Children.Add(text);
+            var b = Btn("Use FSR Quality + frame generation", () =>
+            {
+                M.Set("DLSS", "0"); M.Set("FSR", "1"); M.Set("FSR_MODE", "quality"); M.Set("FSR_FG", "1");
+                lastMessage = "AMD FSR Quality with frame generation set.";
+                QueueSave(); RebuildPage();
+            }, "Primary", "");
+            b.Margin = new Thickness(0);
+            b.VerticalAlignment = VerticalAlignment.Center;
+            Grid.SetColumn(b, 1);
+            g.Children.Add(b);
+            return Card(g);
         }
 
         bool PresetActive(Catalog.Preset p)

@@ -37,6 +37,42 @@ Then pick the **DLSS model**:
 
 It needs an NVIDIA RTX graphics card. On other cards, or with DLSS off, the game renders exactly as before.
 
+## AMD FSR 3.1 / FSR 4 and FSR frame generation
+
+**Graphics › AMD FSR** is the same thing for every graphics card, through AMD's FSR API.
+- **Which FSR runs:** AMD's loader picks the best version for the GPU. FSR 4 (machine learning) runs on Radeon RX 7000 / 9000, FSR 3.1 everywhere else, NVIDIA and Intel included.
+- **The rest is shared:** FSR gets exactly what DLSS gets, so the modes, the 720p floor, the HUD handling and the menus all work the same: the jittered scene, the depth snapshot and the camera motion vectors.
+- **One or the other:** the launcher allows DLSS or FSR, not both.
+
+| FSR mode | Renders at | At 1440p output |
+|---|---|---|
+| **Native AA** | 100 % | 2560×1440 |
+| Quality | 67 % (1.5×) | 1708×960 |
+| Balanced | 59 % (1.7×) | 1506×848 |
+| Performance | 50 % (2×) | 1280×720 |
+
+**FSR sharpening** sets FSR's own sharpening pass (off by default).
+
+**Frame generation (AMD FSR)** shows a generated frame between every two the game renders. The game is CPU-bound, so this is the setting that raises the frame rate you see, especially in crowded streets.
+- **Works with DLSS or FSR:** it needs one of them on, for the depth and motion vectors, on any graphics card. FSR 3.1 frame generation runs everywhere; FSR 4's ML frame generation runs on Radeon RX 9000.
+- **How it hooks in:** the swap chain is wrapped in AMD's frame generation swap chain, which presents and paces the real and generated frames. It gets the upscaled image before the HUD went on, so the HUD stays sharp on generated frames.
+- **Off where it would look wrong:** menus, loading screens and videos.
+- **Measured on the test PC** (RTX 5070 Ti, FSR 3.1 frame generation): about 89 rendered FPS gave about 178 displayed. The port's own FPS counter shows rendered frames; an overlay that counts presents (NVIDIA's, for example) shows the displayed rate.
+- **The trade-off:** a little input latency. It is best with a variable-refresh display and at least ~60 FPS before generation.
+- **DLSS 5 stays off while it is on:** OptiScaler has its own swap chain handling, so the launcher doesn't install it then.
+- **5800X3D-class CPUs:** on 8 cores / 16 threads the shipped thread setup measured the same as the Low-end CPU mode (85.6 vs 87.0 FPS on 8 cores, 88.6 vs 89.5 on 16 threads), so the scheduler isn't the bottleneck there. Crowds add per-character CPU work. Frame generation is the fix that shows; distant animation LOD and adaptive draw distance (Performance page) trim the work itself.
+
+**The files.** FSR needs the AMD FSR SDK files in `<game>\fsr-sdk`, keeping the SDK's folder layout. Only these are needed, from the AMD FSR SDK 2.3.0 repository (github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, tag `v2.3.0`):
+- `Kits\FidelityFX\api\include\` (`ffx_api.h`, `ffx_api_types.h`, `ffx_api_loader.h`, `dx12\ffx_api_dx12.h`);
+- `Kits\FidelityFX\upscalers\include\ffx_upscale.h`;
+- `Kits\FidelityFX\framegeneration\include\` (`ffx_framegeneration.h`, `ffx_framegeneration_api_types.h`, `dx12\ffx_api_framegeneration_dx12.h`);
+- `Kits\FidelityFX\signedbin\` (`amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`, `amd_fidelityfx_framegeneration_dx12.dll`: AMD-signed, loaded at run time);
+- `docs\license.md`.
+
+With only the FSR SDK and no DLSS SDK, the game is built with FSR alone, and the other way round.
+
+**Not tested here: FSR 4.** The test PC has an NVIDIA card. FSR 3.1 upscaling and FSR 3.1 frame generation were checked in game; FSR 4 runs through the same calls, but only on Radeon cards.
+
 ## DLSS 5 Neural Rendering (OptiScaler)
 
 **Graphics › DLSS 5 Neural Rendering** runs NVIDIA's DLSS 5 model (`nvngx_dlssnr.dll`) over the DLSS image. The model synthesises lighting and material detail; the HUD is put back afterwards, untouched.
@@ -97,6 +133,7 @@ The script puts all three back and rebuilds the game, which takes a few minutes.
 | `original\` | the upstream files without the patches (refreshed to upstream `cdb581579f`), for testing the script |
 | `removed-upstream\` | stale `rsx_skate_actor.*` files an upstream update had left behind. They broke the build, so they were moved here |
 | `..\..\dlss-sdk\` | NVIDIA DLSS SDK 310.9.16 (headers, import library, `nvngx_dlss.dll`); see its `LICENSE.txt` |
+| `..\..sr-sdk\` | AMD FSR SDK 2.3.0 files (headers + the signed loader / upscaler / frame generation DLLs); see `docs\license.md` |
 
 ## How it works
 
@@ -142,3 +179,9 @@ These are for testing; the launcher sets `DLSS`, `DLSS_MODE` and `DLSS_PRESET`.
 | `DLSS_DEBUG=zcheck` | which vector each pixel got: green camera, cyan zero motion, red neither, orange newly visible |
 | `DLSS_DEBUG=warp` / `nowarp` | reprojection error |
 | `DLSS_PROBE=<n>` | dump one gameplay frame's vertex-constant layout |
+| `FSR=1` | AMD FSR instead of DLSS (wins when both are set) |
+| `FSR_MODE=<mode>` | `native` (default), `quality`, `balanced`, `performance`, `ultra` |
+| `FSR_SHARPNESS=<0..1>` | FSR's sharpening (default 0, off) |
+| `FSR_VERSION=<text>` | use the FSR provider whose name contains it, e.g. `3.1` (the log lists them) |
+| `FSR_FG=1` | AMD FSR frame generation (with DLSS or FSR on) |
+| `FSR_DLL_DIR=<dir>` | where `amd_fidelityfx_loader_dx12.dll` is (default: next to the exe, then `fsr-sdk\Kits\FidelityFX\signedbin`) |
