@@ -2017,6 +2017,8 @@ struct LanePool {
     volatile long hot_active;              /* v132: lanes currently inside spurs_lane_run_chain (hot mode) */
     volatile long hot_idle;                /* v132: of those, lanes waiting idle on cv_hot (under lk) */
     volatile long st_hot_wait, st_hot_rerun; /* v132 stats */
+    volatile long v242_w;                  /* v242A V242A_WIDTH: active workers this pass (0 = all = old) */
+    CONDITION_VARIABLE cv_idle;            /* v242A: workers outside the width park here */
 };
 /* v132 factorial A/B bits (ppu_loader.cpp PS3_ABX_SEQ): 0x02 hot idle lanes, 0x04 wait-targeted boost. */
 extern volatile int g_abx;
@@ -2094,9 +2096,190 @@ static int taskwait_adapt_active(void)
     }
     return on && (phase < 0 || ((g_ab_phase & 1) == (phase & 1)));
 }
+/* v241A V241A_LEAN (weak-PC CPU budget). The SPURS spin/poll model was tuned on a 28-thread i7-14700F where idle
+ * spinning is free; with few logical CPUs the spinners take the cores the main / FIFO / render threads need.
+ * Lean mode (scheduling only -- the same jobs run in the same order, nothing is skipped):
+ *   - kernel threads spin at most V241A_LEAN_SPIN_US (default 50) after their last busy pass (was SPURS_SPIN_US 500),
+ *   - the audio kernel (inst1) naps after 300 us without work instead of spinning a whole CPU forever,
+ *   - no v147 hot-poll lane spinning, no lane-pool join spin, no EventFlagWait pre-spin,
+ *   - pure PPU task waits (attributed wids) block on the workload's progress generation after 64 rescans
+ *     (the v226 TASKWAIT_EVENT path) instead of spinning.
+ * V241A_LEAN unset/"auto": on when the process affinity mask has fewer than V241A_LEAN_CPUS (default 17 since v242A, was 16) logical
+ * CPUs (re-checked every 2 s, so a mask set after start counts); "0" = never (old behaviour); "1" = always.
+ * V241A_LEAN_PHASE=0|1: only in that PS3_AB phase parity (in-run A/B). */
+static int v241a_lean(void)
+{
+    extern volatile int g_ab_phase;
+    static int mode = -2, phase = -1, lim = 17;   /* v242A: 16 -> 17 (b947: 16 CPUs +0.4 fps, 1 % low +4.3, CPU -225 %) */ static volatile int s_auto = 0; static volatile unsigned long long s_chk = 0;
+    if (__builtin_expect(mode == -2, 0)) {
+        const char* e = getenv("V241A_LEAN"); const char* ph = getenv("V241A_LEAN_PHASE"); const char* c = getenv("V241A_LEAN_CPUS");
+        mode = (e && *e == '0') ? 0 : (e && *e == '1') ? 1 : -1;
+        phase = (ph && *ph) ? atoi(ph) : -1;
+        if (c && *c) lim = atoi(c);
+        fprintf(stderr, "[LEAN] v241A V241A_LEAN mode %s, auto threshold < %d logical CPUs in the affinity mask, A/B parity %d\n",
+                mode == 0 ? "off" : mode == 1 ? "forced on" : "auto", lim, phase);
+    }
+    int on = mode;
+#ifdef _WIN32
+    if (on < 0) {
+        const unsigned long long now = GetTickCount64();
+        if (now - s_chk >= 2000) {
+            DWORD_PTR pm = 0, sm = 0; int n = 64;
+            if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) n = (int)__builtin_popcountll((unsigned long long)pm);
+            const int a = n < lim;
+            if (a != s_auto || !s_chk) fprintf(stderr, "[LEAN] v241A %d logical CPUs in the affinity mask -> lean %s\n", n, a ? "ON" : "off");
+            s_auto = a; s_chk = now;
+        }
+        on = s_auto;
+    }
+#else
+    if (on < 0) on = 0;
+#endif
+    return on && (phase < 0 || ((g_ab_phase & 1) == (phase & 1)));
+}
+/* v242A (weak-PC / low-CPU). Helpers + switches. Every switch: unset = default (see each), "0" = old path
+ * byte-for-byte, "1" = forced on; "auto" features follow v241a_lean() (on only when the process affinity has fewer
+ * than V241A_LEAN_CPUS = 16 logical CPUs) so the 28-CPU bench PC is unchanged. <NAME>_PHASE=0|1 = in-run A/B parity.
+ *   V242A_AFF     (default 1): CPU-set placement lists (P-core sets for SPURS_PCORE_WIDS / B225 ideal CPUs) only
+ *                 contain logical CPUs inside the process affinity mask; an empty intersection = no restriction.
+ *                 The SPURS_LANE_SPIN_US "< 8 CPUs -> 0" default counts the affinity mask, not the machine.
+ *                 On a non-hybrid CPU the lists stay empty (no pinning) exactly as before. Fewer than V242A_PCORE_MIN (8)
+ *                 P-core CPUs in the affinity (e.g. a 2P+8E laptop) -> the SPURS P-core set is not used at all.
+ *   V242A_SERIAL  (default 0; b951 F: +0.16 fps, CPU -10 %; b953 FF with LLSPIN -2.6 fps -> off): workloads in V242A_SERIAL_WIDS (default 0,5,7) visit their lanes serially on
+ *                 their kernel thread instead of waking a 4-thread lane pool (the v222T model, same lanes, same order).
+ *   V242A_NAP     (default 0; b944 F: +0.07 fps, CPU +3 % = no effect -> REJECTED, stays off): an idle kernel thread that found no work for V242A_NAP_AFTER_US (3000)
+ *                 parks V242A_NAP_US (1000) per empty pass instead of SPURS_IDLE_WAIT_US (250); the PPU's task-wait
+ *                 kick / ReadyCountStore kick still wakes it at once. Scheduling only.
+ *   V242A_TWSIG   (default auto = lean; b943 F: +1.9 fps / +10 %, 1 % low +2.7): with the lean blocking task wait, the PPU waiter of a workload is woken after
+ *                 EVERY lane policy-module run that found work (was: only after the whole kernel quantum, i.e. after
+ *                 the slowest lane's <= 2 ms chain, or the 1 ms safety timeout). Wake only; the guest re-checks.
+ *   V242A_AUDSPIN (default 0; b949 F: +0.27 fps, 1 % low +1.3, CPU +4 % = noise -> REJECTED, stays off): in lean mode the audio kernel (inst1, HIGHEST priority) PAUSE-spins only
+ *                 V242A_AUDSPIN_US (50) after its last busy pass before napping (lean: 300 us, old: forever).
+ *   V242A_NOBOOST (default auto = lean; b944 F: +4.2 fps / +17 %, 1 % low +3.2, CPU -17): the v132 ABX-0x04 'stay hot while the PPU waits on this workload' spins
+ *                 (lane workers PAUSE-spin for the next pass, the owning kernel SwitchToThread-spins instead of
+ *                 napping) are skipped; lanes park on their condition variable, the kernel uses its normal idle
+ *                 policy (the PPU wait kick + ReadyCountStore kick still wake it).
+ *   V242A_WIDTH   (default auto = lean; b946 F: fps +-0, 1 % low +2.2, CPU -12 %, 1/3 fewer busy threads; part of
+ *                 the b948 FF bundle +5.6 fps): a parallel lane sweep uses at most V242A_WIDTH_THREADS host threads per
+ *                 workload (kernel included; default max(2, CPUs/2)); the lanes are dealt round-robin to them and each
+ *                 thread visits its lanes one after the other (same lanes, every lane once per pass, the serial-lane
+ *                 model inside each thread). Workers outside the width park. Fewer runnable threads than CPUs.
+ *   V242A_LLSPIN  (default 0; b951 F: +0.9 fps; b953 FF LLSPIN+SERIAL together -2.6 fps -> not on by default): SPU code polling an unchanged lock line (GETLLAR loop, spu_channels.c) yields
+ *                 after V242A_LLSPIN_Y (100, old 2000) identical polls and sleeps on the line's notify CV after
+ *                 V242A_LLSPIN_CV (1000, old 50000). Updated once per kernel pass into g_v242a_llspin. */
+static int v242a_aff_ncpu(void)   /* logical CPUs in the process affinity mask (V242A_NCPU overrides), 64 = unknown */
+{
+    const char* o = getenv("V242A_NCPU");
+    if (o && *o) return atoi(o);
+#ifdef _WIN32
+    DWORD_PTR pm = 0, sm = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm) return (int)__builtin_popcountll((unsigned long long)pm);
+#endif
+    return 64;
+}
+static int v242a_aff_on(void)
+{
+    static int on = -1;
+    if (__builtin_expect(on < 0, 0)) { const char* e = getenv("V242A_AFF"); on = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[LEAN] v242A V242A_AFF=%d (placement CPU sets limited to the process affinity mask)\n", on); }
+    return on;
+}
+#ifdef _WIN32
+static int v242a_cpu_in_aff(int group, int idx)   /* 1 = logical CPU group:idx is in the process affinity (group 0 only) */
+{
+    static DWORD_PTR s_pm = 0; static unsigned long long s_t = 0;
+    const unsigned long long now = GetTickCount64();
+    if (!s_pm || now - s_t >= 2000) { DWORD_PTR pm = 0, sm = 0; if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm) s_pm = pm; s_t = now; }
+    if (!s_pm) return 1;
+    if (group != 0) return 1;   /* > 64 CPUs: process affinity spans groups -> keep the old behaviour */
+    return idx < 64 && ((s_pm >> idx) & 1);
+}
+#endif
+/* generic v242A feature switch: def = default mode when unset (0 off, 1 on, -1 auto = follow lean) */
+struct v242a_sw { const char* name; int mode, phase; };
+static int v242a_feat(struct v242a_sw* f, int def)
+{
+    extern volatile int g_ab_phase;
+    if (__builtin_expect(f->mode == -2, 0)) {
+        char b[64]; const char* e = getenv(f->name);
+        snprintf(b, sizeof b, "%s_PHASE", f->name); const char* ph = (getenv)(b);   /* real getenv: the rsx_getenv_cache macro keys on the pointer (stack buffer!) */
+        f->mode = (e && *e == '0') ? 0 : (e && *e == '1') ? 1 : (e && *e) ? -1 : def;
+        f->phase = (ph && *ph) ? atoi(ph) : -1;
+        fprintf(stderr, "[LEAN] v242A %s mode %s, A/B parity %d\n", f->name, f->mode == 0 ? "off" : f->mode == 1 ? "forced on" : "auto (= lean)", f->phase);
+    }
+    int on = f->mode < 0 ? v241a_lean() : f->mode;
+    /* _PHASE 0|1: PS3_AB phase parity; 2|3: bit 1 of the phase counter (2 = clear, 3 = set) -> two features with
+     * PHASE 0 and PHASE 2 give a 2x2 factorial A/B in one run (cpuab.py --fact) */
+    return on && (f->phase < 0 || (f->phase < 2 ? ((g_ab_phase & 1) == f->phase) : (((g_ab_phase >> 1) & 1) == (f->phase & 1))));
+}
+static struct v242a_sw s_v242a_serial = { "V242A_SERIAL", -2, -1 }, s_v242a_nap = { "V242A_NAP", -2, -1 },
+                       s_v242a_twsig = { "V242A_TWSIG", -2, -1 }, s_v242a_audspin = { "V242A_AUDSPIN", -2, -1 },
+                       s_v242a_noboost = { "V242A_NOBOOST", -2, -1 }, s_v242a_width = { "V242A_WIDTH", -2, -1 },
+                       s_v242a_llspin = { "V242A_LLSPIN", -2, -1 };
+static int v242a_ncpu_cached(void)
+{
+    static volatile int s_n = 0; static volatile unsigned long long s_t = 0;
+#ifdef _WIN32
+    const unsigned long long now = GetTickCount64();
+    if (!s_n || now - s_t >= 2000) { s_n = v242a_aff_ncpu(); s_t = now; }
+#else
+    if (!s_n) s_n = v242a_aff_ncpu();
+#endif
+    return s_n;
+}
+static long v242a_width_workers(u32 nworkers)   /* 0 = all workers (old) */
+{
+    if (nworkers < 2 || !v242a_feat(&s_v242a_width, -1)) return 0;   /* default auto (b948 FF bundle, b946 F) */
+    static int s_t = -2; if (s_t == -2) { const char* e = getenv("V242A_WIDTH_THREADS"); s_t = (e && *e) ? atoi(e) : -1; }
+    int t = s_t > 0 ? s_t : v242a_ncpu_cached() / 2; if (t < 2) t = 2;
+    return (u32)(t - 1) >= nworkers ? 0 : (long)(t - 1);
+}
+static u32 v242a_serial_mask(void)
+{
+    static int init = 0; static u32 m = 0;
+    if (__builtin_expect(!init, 0)) {
+        const char* e = getenv("V242A_SERIAL_WIDS"); if (!e) e = "0,5,7";
+        for (const char* q = e; *q; ) { while (*q == ',' || *q == ' ') q++; if (!*q) break;
+            int w = atoi(q); if (w >= 0 && w < 16) m |= 1u << w; while (*q && *q != ',') q++; }
+        fprintf(stderr, "[LEAN] v242A V242A_SERIAL_WIDS mask 0x%04X\n", m);
+        init = 1;
+    }
+    return m;
+}
+/* v242A lean components + "lite" tier for big PCs.
+ *   V241A_LEAN_BITS (hex, default 3F = all): which v241A lean components a lean phase uses:
+ *     01 kernel spin window <= 50 us, 02 audio kernel naps, 04 no v147 hot-poll spin, 08 no lane-pool spin,
+ *     10 no EventFlagWait pre-spin, 20 blocking PPU task waits (TASKWAIT_EVENT path).
+ *   V242A_LITE (default 0; b950 28 CPUs: -0.6 fps, CPU -45 %, but late audio holes 5.9 -> 12.3 => REJECTED; 1 = on; V242A_LITE_PHASE = A/B parity): when lean is NOT active (>= 16 CPUs),
+ *     apply only the components in V242A_LITE_BITS (hex, default 12 = audio nap + no EF pre-spin), i.e. the ones that
+ *     save CPU without sitting on the critical path. Lean off + lite off = old behaviour exactly. */
+static struct v242a_sw s_v242a_lite = { "V242A_LITE", -2, -1 }, s_v242a_audkeep = { "V242A_AUDKEEP", -2, -1 };
+static int v242a_lean_bit(int bit)
+{
+    static int s_lb = -1, s_lite = -1;
+    if (__builtin_expect(s_lb < 0, 0)) {
+        const char* a = getenv("V241A_LEAN_BITS"); const char* b = getenv("V242A_LITE_BITS");
+        int lb = (a && *a) ? (int)strtoul(a, 0, 16) : 0x3F, li = (b && *b) ? (int)strtoul(b, 0, 16) : 0x12;
+        s_lite = li; s_lb = lb;
+        fprintf(stderr, "[LEAN] v242A lean components 0x%02X, lite components 0x%02X (V241A_LEAN_BITS / V242A_LITE_BITS)\n", lb, li);
+    }
+    if (v241a_lean()) {
+        /* v242A V242A_AUDKEEP (default 1 = on for >= V242A_AUDKEEP_CPUS (14) CPUs; 0 = off; _PHASE A/B): with lean on a
+         * 14-16 CPU machine the audio kernel keeps its old spin (no lean audio nap): b947 16 CPUs lean raised late
+         * audio holes 9.9 -> 15.9 per report, b950 the nap alone doubled them on 28 CPUs; at 12 CPUs lean lowered them. */
+        if (bit == 0x02 && (s_lb & 0x02)) {
+            static int s_ak = -1; if (s_ak < 0) { const char* e = getenv("V242A_AUDKEEP_CPUS"); s_ak = (e && *e) ? atoi(e) : 14; }
+            if (v242a_ncpu_cached() >= s_ak && v242a_feat(&s_v242a_audkeep, 1)) return 0;
+        }
+        return (s_lb & bit) != 0;
+    }
+    if (s_v242a_lite.mode == 0) return 0;
+    return (s_lite & bit) && v242a_feat(&s_v242a_lite, 0);
+}
 static int taskwait_event_active(void)
 {
     extern volatile int g_ab_phase;
+    if (v242a_lean_bit(0x20)) return 1;   /* v241A lean: block instead of spinning in pure task waits (v242A: component 20) */
     static int on = -1, phase = -2;
     if (on < 0) {
         const char* e = getenv("TASKWAIT_EVENT");
@@ -2113,6 +2296,10 @@ static inline void taskwait_event_signal(u32 wid)
     if (wid >= 16 || g_tw_wid_n[wid] <= 0 || !taskwait_event_active()) return;
     InterlockedIncrement(&s_tw_event_gen[wid]);
     WakeByAddressAll((PVOID)&s_tw_event_gen[wid]);
+}
+static inline void v242a_twsig(u32 wid)   /* v242A V242A_TWSIG: mid-quantum wake of a blocked PPU waiter */
+{
+    if (wid < 16 && g_tw_wid_n[wid] > 0 && v242a_feat(&s_v242a_twsig, -1)) taskwait_event_signal(wid);   /* default auto (b943: +10 % fps at 4 CPUs) */
 }
 /* v96a [LANEPROF] lane-pool timing (spurs_policy.c prints it): [wid] = {wake ticks, wakes, join-wait ticks, joins} */
 extern volatile long long g_lp_pool[16][4];
@@ -2145,7 +2332,7 @@ static int spurs_lane_spin_us(void)
         int v = e ? atoi(e) : 200;
         if (!e) {
 #ifdef _WIN32
-            if (GetActiveProcessorCount(0xFFFF) < 8) v = 0;
+            if ((v242a_aff_on() ? v242a_aff_ncpu() : (int)GetActiveProcessorCount(0xFFFF)) < 8) v = 0;   /* v242A V242A_AFF */
 #else
             if (sysconf(_SC_NPROCESSORS_ONLN) < 8) v = 0;
 #endif
@@ -2154,6 +2341,7 @@ static int spurs_lane_spin_us(void)
         fprintf(stderr, "[spurs-kern] v96a SPURS_LANE_SPIN_US=%d (lane pool spin-waits for the next pass / the join; 0 off; off in PS3_AB phase 1)\n", v);
         us = v;
     }
+    if (v242a_lean_bit(0x08)) return 0;   /* v241A lean: no lane-pool spin (v242A: component 08) */
     { static int s_ab = -1; if (s_ab < 0) { const char* e = getenv("SPURS_LANE_SPIN_AB"); s_ab = (e && *e == '1') ? 1 : 0; }   /* v97f: phase 1 now belongs to v97f */
       if (g_abx & 0x08) return us < 50 ? us : 50;   /* v132 ABX 0x08 "less spinning": lane spin 200 -> 50 us */
       return (s_ab && g_ab_mask == 1) ? 0 : us; }
@@ -2235,6 +2423,24 @@ static u32 spurs_hot_wids(void)
     }
     return m;
 }
+/* v241A V241A_HOTX_WIDS=<wid,...> (default empty = old): extra workloads that get the v147 hot-lane mode + spin poll
+ * while the PPU waits on them (e.g. 1 = m_joblistMesh, 8), on top of SPURS_HOT_WIDS. V241A_HOTX_PHASE=0|1: only in that
+ * PS3_AB phase parity (in-run A/B). Scheduling only. */
+static u32 v241a_hotx(void)
+{
+    extern volatile int g_ab_phase;
+    static int init = 0, phase = -1; static u32 m = 0;
+    if (__builtin_expect(!init, 0)) {
+        const char* e = getenv("V241A_HOTX_WIDS"); const char* ph = getenv("V241A_HOTX_PHASE");
+        if (e) for (const char* q = e; *q; ) { while (*q == ',' || *q == ' ') q++; if (!*q) break;
+            int w = atoi(q); if (w >= 0 && w < 16) m |= 1u << w; while (*q && *q != ',') q++; }
+        phase = (ph && *ph) ? atoi(ph) : -1;
+        fprintf(stderr, "[spurs-kern] v241A V241A_HOTX_WIDS mask 0x%04X (A/B parity %d)\n", m, phase);
+        init = 1;
+    }
+    if (!m) return 0;
+    return (phase < 0 || ((g_ab_phase & 1) == (phase & 1))) ? m : 0;
+}
 static int spurs_hot_poll_us(void)
 {
     static int us = -1;
@@ -2252,12 +2458,30 @@ static struct bjc_iv s_bjc_run[BJC_RN], s_bjc_wait[BJC_WN];
 static volatile long s_bjc_ri = 0, s_bjc_wi = 0;
 static volatile long s_bjc_lane[8];
 static int bjc_wid(void) { static int w = -2; if (w == -2) { const char* e = getenv("BJCONC_WID"); w = e ? atoi(e) : 2; } return w; }
+/* v241A BJEV=1 (diagnostic, needs BJDIAG=1): event log of the BJCONC workload -- every policy-module run (busy AND idle)
+ * with the BatchJobList header words 0x40..0x7F (shared claim index + per-lane cursors of the 4 sub-lists) at its end,
+ * and every ReadyCountStore of that wid. [BJEV] prints the events around 2 long PPU waits per 10 s window. */
+struct bjev { unsigned long long t0, t1; int lane, polls, kind; u32 h[16]; };
+#define BJEV_N 65536
+static struct bjev s_bjev[BJEV_N];
+static volatile long s_bjev_i = 0;
+static u32 bj_data(void);
+static int bjev_on(void) { static int v = -1; if (v < 0) { const char* e = getenv("BJEV"); v = (e && *e == '1'); } return v; }
+static void bjev_add(unsigned long long t0, unsigned long long t1, int lane, int polls, int kind)
+{
+    const long i = InterlockedIncrement(&s_bjev_i) - 1;
+    struct bjev* e = &s_bjev[i & (BJEV_N - 1)];
+    e->t0 = t0; e->t1 = t1; e->lane = lane; e->polls = polls; e->kind = kind;
+    const u32 d = bj_data();
+    for (int k = 0; k < 16; k++) e->h[k] = d ? vm_read32(d + 0x40 + 4u * k) : 0;
+}
 static void bjc_pm(spu_lifted_entry_fn fn, int image_id, const uint8_t* pm, uint32_t sz, uint64_t arg, u32 wid, u32 ea, u32 lane)
 {
     extern SPU_PM_TLS volatile unsigned g_spurs_pm_polls;
     if (!bj_on() || (int)wid != bjc_wid()) { spu_run_policy_module(fn, image_id, pm, sz, arg, wid, ea, lane); return; }
     const unsigned long long t0 = __rdtsc();
     spu_run_policy_module(fn, image_id, pm, sz, arg, wid, ea, lane);
+    if (bjev_on()) bjev_add(t0, __rdtsc(), (int)lane, (int)g_spurs_pm_polls, 1);   /* v241A */
     if (g_spurs_pm_polls) {
         const unsigned long long t1 = __rdtsc();
         const long i = InterlockedIncrement(&s_bjc_ri) - 1;
@@ -2333,6 +2557,31 @@ static void bjc_report(void)
             fprintf(stderr, "%s (%d runs)\n", line, cnt);
             shown++; wi += step - 1;
         }
+        /* v241A [BJEV]: full event list around the first 2 long waits of this window */
+        if (bjev_on()) {
+            const long e1 = s_bjev_i; long e0 = e1 - (BJEV_N - 1024); if (e0 < 0) e0 = 0;
+            int done = 0;
+            for (long wi = w1 - 1; wi >= w0 && done < 2; wi--) {   /* newest first: the ring keeps only the last ~1 s */
+                const struct bjc_iv w = s_bjc_wait[wi & (BJC_WN - 1)];
+                if (w.t1 <= w.t0) continue;
+                const double wus = 1e6 * (double)(w.t1 - w.t0) / (double)s_hz;
+                if (wus < 1500.0) continue;
+                done++;
+                const unsigned long long lo = w.t0 - s_hz / 500, hi = w.t1 + s_hz / 5000;   /* 2 ms before .. 0.2 ms after */
+                fprintf(stderr, "[BJEV] wait #%d %.0f us (t in us from wait start)\n", done, wus);
+                int pr = 0;
+                for (long i = e0; i < e1 && pr < 1500; i++) {
+                    const struct bjev* e = &s_bjev[i & (BJEV_N - 1)];
+                    if (e->t1 < lo || e->t0 > hi) continue;
+                    pr++;
+                    const double a = 1e6 * ((double)e->t0 - (double)w.t0) / (double)s_hz, b = 1e6 * ((double)e->t1 - (double)w.t0) / (double)s_hz;
+                    if (e->kind == 2) { fprintf(stderr, "[BJEV]  %8.1f RCS value %d |", a, e->polls); }
+                    else fprintf(stderr, "[BJEV]  %8.1f..%8.1f L%d polls %d |", a, b, e->lane, e->polls);
+                    for (int k = 0; k < 16; k++) fprintf(stderr, "%s%08X", (k & 3) ? " " : " |", e->h[k]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
     }
     unsigned long long wsum = 0, asum = 0; for (int i = 0; i < 7; i++) { wsum += hw[i]; asum += ha[i]; }
     if (!wsum) wsum = 1;
@@ -2357,12 +2606,13 @@ static unsigned spurs_lane_run_chain(struct LanePool* lp, spu_lifted_entry_fn fn
      * real SPUs do (they re-enter the module at once). Before: idle lanes parked until the slowest lane, the join and
      * the next kernel round (~260-290 us per round, ~12-25 rounds per slow PPU wait). Scheduling only. */
     /* v147: ABX 0x800 = hot mode + spin-poll while the PPU waits, for SPURS_HOT_WIDS only */
-    const int hotpoll = cus && (g_abx & 0x800) && wid < 16 && ((spurs_hot_wids() >> wid) & 1);
+    const int hotpoll = cus && (g_abx & 0x800) && wid < 16 && (((spurs_hot_wids() | v241a_hotx()) >> wid) & 1) && !v242a_lean_bit(0x04);   /* v241A lean: no hot-poll spin (v242A: component 04) */
     const int hot = cus && (hotpoll || (g_abx & 0x200));
     if (hot) InterlockedIncrement(&lp->hot_active);
     long e = cus ? lp->ch_epoch : 0;
     bjc_pm(fn, image_id, pm, sz, arg, wid, ea, lane);
     unsigned sum = g_spurs_pm_polls;
+    if (sum) v242a_twsig(wid);   /* v242A */
     if (!cus) return sum;
     static LONGLONG s_f = 0;
     if (!s_f) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_f = f.QuadPart; }
@@ -2409,6 +2659,7 @@ static unsigned spurs_lane_run_chain(struct LanePool* lp, spu_lifted_entry_fn fn
                 e = lp->ch_epoch;
                 bjc_pm(fn, image_id, pm, sz, arg, wid, ea, lane);
                 p = g_spurs_pm_polls; sum += p;
+                if (p) v242a_twsig(wid);   /* v242A */
                 if (spurs_stats_on()) { InterlockedIncrement(&lp->st_ch_re); if (!p) InterlockedIncrement(&lp->st_ch_idle); }
                 continue;
             }
@@ -2434,6 +2685,7 @@ static unsigned spurs_lane_run_chain(struct LanePool* lp, spu_lifted_entry_fn fn
         e = lp->ch_epoch;
         bjc_pm(fn, image_id, pm, sz, arg, wid, ea, lane);
         p = g_spurs_pm_polls; sum += p;
+        if (p) v242a_twsig(wid);   /* v242A */
         if (spurs_stats_on()) { InterlockedIncrement(&lp->st_ch_re); if (!p) InterlockedIncrement(&lp->st_ch_idle); }
     }
     if (hot) {
@@ -2524,7 +2776,8 @@ static void b225_ideal_init(void)
                 for (int pass = 0; pass < 2; pass++) {   /* pass 0: first logical CPU of each P-core, pass 1: the siblings */
                     BYTE seen[256]; memset(seen, 0, sizeof seen);
                     for (ULONG o = 0; o < len; ) { PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(buf + o);
-                        if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass == maxc && n < 256) {
+                        if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass == maxc && n < 256 &&
+                            (!v242a_aff_on() || v242a_cpu_in_aff(c->CpuSet.Group, c->CpuSet.LogicalProcessorIndex))) {   /* v242A V242A_AFF */
                             const BYTE ci = c->CpuSet.CoreIndex; const int first = !seen[ci]; seen[ci] = 1;
                             if ((pass == 0) == first) { s_b225_pc[n].Group = c->CpuSet.Group; s_b225_pc[n].Number = c->CpuSet.LogicalProcessorIndex;
                                                         s_b225_pc[n].Reserved = 0; n++; } }
@@ -2625,10 +2878,15 @@ static void spurs_v97_pcore_apply(u32 wid, const char* who, int want)
                     o += c->Size; }
                 if (maxc != minc)
                     for (ULONG o = 0; o < len; ) { PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(buf + o);
-                        if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass == maxc && n < 256) s_ids[n++] = c->CpuSet.Id;
+                        if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass == maxc && n < 256 &&
+                            (!v242a_aff_on() || v242a_cpu_in_aff(c->CpuSet.Group, c->CpuSet.LogicalProcessorIndex))) s_ids[n++] = c->CpuSet.Id;   /* v242A V242A_AFF */
                         o += c->Size; }
             }
             free(buf);
+        }
+        if (n > 0 && v242a_aff_on()) {   /* v242A V242A_AFF: too few P-core CPUs in the affinity -> no P-core restriction */
+            const char* e = getenv("V242A_PCORE_MIN"); const long mn = (e && *e) ? atol(e) : 8;
+            if (n < mn) { fprintf(stderr, "[PCORE] v242A only %ld P-core CPUs in the affinity (< V242A_PCORE_MIN %ld): SPURS P-core sets off\n", n, mn); n = 0; }
         }
         s_n = n;
     }
@@ -2643,6 +2901,8 @@ static void spurs_v97_pcore_apply(u32 wid, const char* who, int want)
     (void)who; (void)wid; (void)want;
 #endif
 }
+/* v241A: V241A_WAITPC (w1/w6/w8/w9 lanes restricted to the P-cores while the PPU waits on them) was A/B'd in b930:
+ * -0.96 fps, 1% low -3.1, 0.1% low -4.1 -> REJECTED and removed. */
 struct LaneWorkerArg { struct LanePool* lp; u32 idx; };
 static DWORD WINAPI spurs_lane_worker(LPVOID p)
 {
@@ -2661,9 +2921,15 @@ static DWORD WINAPI spurs_lane_worker(LPVOID p)
         struct spurs_pm_worker_arg j;
         if (last_busy && lp->gen == my) { int su = spurs_lane_spin_us(); if (su) spurs_lane_spin(&lp->gen, my, 1, su); }
         /* v132 ABX 0x04: while the PPU waits on THIS workload, its lanes stay hot (spin) instead of parking */
-        while (lp->gen == my && spurs_tw_boost_wid(lp->job.wid)) spurs_lane_spin(&lp->gen, my, 1, 50);
+        while (lp->gen == my && spurs_tw_boost_wid(lp->job.wid) && !v242a_feat(&s_v242a_noboost, -1)) spurs_lane_spin(&lp->gen, my, 1, 50);   /* v242A V242A_NOBOOST */
         AcquireSRWLockExclusive(&lp->lk);
-        while (lp->gen == my) SleepConditionVariableSRW(&lp->cv_go, &lp->lk, INFINITE, 0);
+        for (;;) {   /* v242A V242A_WIDTH: a worker outside this pass's width skips the pass and parks on cv_idle */
+            while (lp->gen == my) SleepConditionVariableSRW(&lp->cv_go, &lp->lk, INFINITE, 0);
+            if (!(lp->v242_w && wa->idx >= (u32)lp->v242_w)) break;
+            my = lp->gen;
+            while (lp->v242_w && wa->idx >= (u32)lp->v242_w) SleepConditionVariableSRW(&lp->cv_idle, &lp->lk, INFINITE, 0);
+        }
+        const long w242 = lp->v242_w;   /* v242A */
         my = lp->gen; j = lp->job;
         unsigned long long kt = lp->kick_tsc;
         ReleaseSRWLockExclusive(&lp->lk);
@@ -2706,10 +2972,17 @@ static DWORD WINAPI spurs_lane_worker(LPVOID p)
          * run, the rotate lane for a SPURS_PAR_KICK run); workers take the others. */
         u32 lane = (j.spu_num + 1 + wa->idx) % (lp->nworkers + 1);
         spurs_lane_run_chain(lp, j.fn, j.image_id, j.pm, j.pm_size, j.arg, j.wid, j.ea, lane);   /* v97f: was one run */
+        unsigned w242_polls = g_spurs_pm_polls;
+        if (w242) {   /* v242A V242A_WIDTH: this thread also visits lane offsets idx+1 + k*(w+1) */
+            for (u32 o = wa->idx + 1 + (u32)(w242 + 1); o <= lp->nworkers; o += (u32)(w242 + 1)) {
+                spurs_lane_run_chain(lp, j.fn, j.image_id, j.pm, j.pm_size, j.arg, j.wid, j.ea, (j.spu_num + o) % (lp->nworkers + 1));
+                w242_polls += g_spurs_pm_polls;
+            }
+        }
         if (stats) QueryPerformanceCounter(&q1);
-        last_busy = g_spurs_pm_polls != 0;
+        last_busy = w242_polls != 0;
         AcquireSRWLockExclusive(&lp->lk);
-        lp->polls[wa->idx] = g_spurs_pm_polls;
+        lp->polls[wa->idx] = w242_polls;
         lp->spin[wa->idx] = stats ? g_spu_spin_polls - sp0 : 0;
         if (stats) {
             lp->st_ms_q[lane] += q1.QuadPart - q0.QuadPart;
@@ -2718,7 +2991,7 @@ static DWORD WINAPI spurs_lane_worker(LPVOID p)
         lp->done++;
         /* One kernel waits for the whole lane batch. Intermediate completions
          * cannot satisfy it and used to cause three needless wake/park cycles. */
-        if ((u32)lp->done == lp->nworkers) WakeAllConditionVariable(&lp->cv_done);
+        if ((u32)lp->done == (w242 ? (u32)w242 : lp->nworkers)) WakeAllConditionVariable(&lp->cv_done);   /* v242A: join target = width */
         ReleaseSRWLockExclusive(&lp->lk);
     }
     return 0;
@@ -2755,6 +3028,7 @@ static int spurs_par_lanes_wid(u32 wid)
         }
         if (t_on && !(g_abx & t_bit) && ((t_mask >> wid) & 1)) return 0;
     }
+    if (((v242a_serial_mask() >> wid) & 1) && v242a_feat(&s_v242a_serial, 0)) return 0;   /* default 0 (b951 F +0.2 fps / CPU -10 %, b953 FF with LLSPIN -2.6 fps) */   /* v242A V242A_SERIAL */
     return 1;
 }
 /* maxContention limits simultaneous execution, not the number of virtual SPU
@@ -2807,6 +3081,29 @@ static struct LanePool* spurs_lane_pool(u32 wid, u32 nl)
     return lp;
 }
 
+/* v242A V242A_WIDTH: set this pass's width under lp->lk (before gen++); widening wakes parked workers */
+static inline long v242a_width_set(struct LanePool* lp)
+{
+    const long w = v242a_width_workers(lp->nworkers), old = lp->v242_w;
+    lp->v242_w = w;
+    if (old && (!w || w > old)) WakeAllConditionVariable(&lp->cv_idle);
+    return w;
+}
+/* kernel-side extra lanes (offsets k*(w+1), k >= 1) of a width-limited pass; returns their polls */
+static unsigned spurs_lane_run_chain(struct LanePool* lp, spu_lifted_entry_fn fn, int image_id, const uint8_t* pm,
+                                     uint32_t sz, uint64_t arg, u32 wid, u32 ea, u32 lane);
+static unsigned v242a_kernel_extra(struct LanePool* lp, long w, u32 sn, spu_lifted_entry_fn fn, int image_id, const uint8_t* pm,
+                                   uint32_t sz, uint64_t arg, u32 wid, u32 ea)
+{
+    extern SPU_PM_TLS volatile unsigned g_spurs_pm_polls;
+    unsigned sum = 0;
+    if (!w) return 0;
+    for (u32 o = (u32)(w + 1); o <= lp->nworkers; o += (u32)(w + 1)) {
+        spurs_lane_run_chain(lp, fn, image_id, pm, sz, arg, wid, ea, (sn + o) % (lp->nworkers + 1));
+        sum += g_spurs_pm_polls;
+    }
+    return sum;
+}
 /* v31 SPURS_PAR_KICK (default on; =0 off). v30f cutscene profile: w0's kernel thread
  * 84-90% busy, max run 104-140 ms, yet its parallel lanes sat at ~1% each with ~30 busy
  * runs per 10 s. Cause: SPURS_IDLE_ROTATE. After two empty sweeps an idle workload
@@ -2818,11 +3115,13 @@ static struct LanePool* spurs_lane_pool(u32 wid, u32 nl)
  * joins them afterwards. Idle rotate runs never poll, so idle cost is unchanged. */
 static SPU_PM_TLS struct LanePool* t_kick_lp;
 static SPU_PM_TLS int t_kicked;
+static SPU_PM_TLS long t_kick_w;   /* v242A: width of the kicked pass */
 static void spurs_par_kick_cb(void)
 {
     struct LanePool* lp = t_kick_lp;
     if (!lp || t_kicked) return;
     AcquireSRWLockExclusive(&lp->lk);
+    t_kick_w = v242a_width_set(lp);   /* v242A */
     lp->done = 0; lp->gen++; lp->kick_tsc = __rdtsc();
     WakeAllConditionVariable(&lp->cv_go);
     ReleaseSRWLockExclusive(&lp->lk);
@@ -2854,10 +3153,12 @@ static unsigned spurs_run_lane_kickable(u32 wid, u32 nl, u32 sn, spu_lifted_entr
     g_spurs_pm_poll_hook = 0;
     unsigned sum = g_spurs_pm_polls;
     if (t_kicked) {
-        if ((u32)lp->done < lp->nworkers) { int su = spurs_lane_spin_us(); if (su) spurs_lane_spin(&lp->done, (long)lp->nworkers, 0, su); }   /* v96a */
+        const long kw = t_kick_w; const u32 tgt = kw ? (u32)kw : lp->nworkers;   /* v242A V242A_WIDTH */
+        if (kw) { g_spurs_pm_poll_hook = 0; sum += v242a_kernel_extra(lp, kw, sn, fn, image_id, pm, sz, arg, wid, ea); }
+        if ((u32)lp->done < tgt) { int su = spurs_lane_spin_us(); if (su) spurs_lane_spin(&lp->done, (long)tgt, 0, su); }   /* v96a */
         AcquireSRWLockExclusive(&lp->lk);
-        while ((u32)lp->done < lp->nworkers) SleepConditionVariableSRW(&lp->cv_done, &lp->lk, INFINITE, 0);
-        for (u32 i = 0; i < lp->nworkers; i++) { sum += lp->polls[i]; g_spu_spin_polls += lp->spin[i]; }
+        while ((u32)lp->done < tgt) SleepConditionVariableSRW(&lp->cv_done, &lp->lk, INFINITE, 0);
+        for (u32 i = 0; i < tgt; i++) { sum += lp->polls[i]; g_spu_spin_polls += lp->spin[i]; }
         if (spurs_stats_on()) lp->st_kicks++;
         ReleaseSRWLockExclusive(&lp->lk);
     }
@@ -2875,6 +3176,7 @@ static unsigned spurs_run_lanes_parallel(u32 wid, u32 nl, spu_lifted_entry_fn fn
     AcquireSRWLockExclusive(&lp->lk);
     lp->job.fn = fn; lp->job.image_id = image_id; lp->job.pm = pm; lp->job.pm_size = sz;
     lp->job.arg = arg; lp->job.wid = wid; lp->job.ea = ea; lp->job.spu_num = 0;
+    const long pw = v242a_width_set(lp);   /* v242A V242A_WIDTH */
     lp->done = 0; lp->gen++; lp->kick_tsc = __rdtsc();
     WakeAllConditionVariable(&lp->cv_go);
     ReleaseSRWLockExclusive(&lp->lk);
@@ -2884,16 +3186,19 @@ static unsigned spurs_run_lanes_parallel(u32 wid, u32 nl, spu_lifted_entry_fn fn
     spurs_lane_run_chain(lp, fn, image_id, pm, sz, arg, wid, ea, 0);   /* v97f: was one run */
     if (stats) QueryPerformanceCounter(&q1);
     unsigned sum = g_spurs_pm_polls;
+    const unsigned k0_polls = g_spurs_pm_polls;   /* v242A: lane 0's own polls (stats below) */
+    const u32 tgt = pw ? (u32)pw : lp->nworkers;   /* v242A V242A_WIDTH join target */
+    if (pw) sum += v242a_kernel_extra(lp, pw, 0, fn, image_id, pm, sz, arg, wid, ea);
     unsigned long long jw0 = spu_laneprof_on() ? __rdtsc() : 0;   /* v96a: kernel lane done -> all lanes done */
-    if ((u32)lp->done < lp->nworkers) { int su = spurs_lane_spin_us(); if (su) spurs_lane_spin(&lp->done, (long)lp->nworkers, 0, su); }   /* v96a */
+    if ((u32)lp->done < tgt) { int su = spurs_lane_spin_us(); if (su) spurs_lane_spin(&lp->done, (long)tgt, 0, su); }   /* v96a */
     AcquireSRWLockExclusive(&lp->lk);
     if (stats) {
         lp->st_ms_q[0] += q1.QuadPart - q0.QuadPart;
-        if (g_spurs_pm_polls) lp->st_busy[0]++;
+        if (pw ? k0_polls : g_spurs_pm_polls) lp->st_busy[0]++;
         lp->st_runs++;
     }
-    while ((u32)lp->done < lp->nworkers) SleepConditionVariableSRW(&lp->cv_done, &lp->lk, INFINITE, 0);
-    for (u32 i = 0; i < lp->nworkers; i++) { sum += lp->polls[i]; g_spu_spin_polls += lp->spin[i]; }
+    while ((u32)lp->done < tgt) SleepConditionVariableSRW(&lp->cv_done, &lp->lk, INFINITE, 0);
+    for (u32 i = 0; i < tgt; i++) { sum += lp->polls[i]; g_spu_spin_polls += lp->spin[i]; }
     ReleaseSRWLockExclusive(&lp->lk);
     if (jw0 && wid < 16) {
         __atomic_add_fetch(&g_lp_pool[wid][2], (long long)(__rdtsc() - jw0), __ATOMIC_RELAXED);
@@ -3145,6 +3450,22 @@ static long long tw_now_us(void)
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 static SPU_PM_TLS int t_tw_wid = -1;
 static long long s_tww_n[17], s_tww_us[17], s_tww_long[17], s_tww_max[17];
+/* v241A [TWSPLIT] (with LANEPROF): how much of each workload's PPU wait is idle re-polling (consecutive ps3_taskwait_spin
+ * calls <= 6 us apart = a rescan that found nothing to do) vs PPU work inside the wait loop (item updates that kick the
+ * next jobs: func_00287058 calls every item's update between rescans). rdtsc ticks. */
+static long long s_tws_idle[17], s_tws_tot[17];
+static SPU_PM_TLS unsigned long long t_tws_last, t_tws_t0, t_tws_idle;
+static unsigned long long s_tws_lim;
+static long long s_tws_hn[17][9], s_tws_ht[17][9];   /* v241A: spin-to-spin gap histogram per wid (<2,4,8,16,32,64,128,256,>=256 us) */
+static SPU_PM_TLS int t_tws_w;
+static inline void tws_gap(unsigned long long g)
+{
+    const int w = t_tws_w; if (w < 0 || w > 16) return;
+    const unsigned long long us6 = s_tws_lim;   /* ticks per 6 us */
+    int b = 0; unsigned long long lim = us6 / 3;   /* 2 us */
+    while (b < 8 && g >= lim) { b++; lim <<= 1; }
+    s_tws_hn[w][b]++; s_tws_ht[w][b] += (long long)g;
+}
 #define TWT_N 8   /* v221A [TWTHR]: per waiting PPU thread */
 static struct { volatile long tid; long long gtid; volatile long long us[17]; volatile long n[17]; char pad[64]; } s_twt[TWT_N];
 static volatile long s_twt_used;
@@ -3402,6 +3723,80 @@ static void bj_end(long long dur_us)
         s_bj_w = s_bj_jobs = s_bj_maxshare_sum = s_bj_sync_sum = s_bj_jobsl_sum = 0; memset(s_bj_lanes, 0, sizeof s_bj_lanes); s_t0 = now;
     }
 }
+/* v241A W16PROF=1 (diagnostic, default off): host call-stack sampler of the MAIN guest thread while it is inside an
+ * unattributed (w16 = func_00287058 item-update pass) task wait; W16PROF=2 samples the main thread all the time,
+ * W16PROF=3 only inside ANY hooked wait. A sampler thread suspends the main thread every W16PROF_US (default 250) us,
+ * unwinds its host stack with RtlVirtualUnwind (x64 unwind tables, no frame pointers needed) and appends the frame
+ * RVAs to W16PROF_FILE (default w16prof.bin): per sample u16 nframes, u16 flags (bit0 = inside a wait, bits 8.. = wid),
+ * then u32 rva[n] (leaf first). Resolve offline against the build's .map (tools: ../_xfer/bak_v241A/w16prof.py).
+ * Nothing allocates or locks while the target is suspended. */
+#ifdef _WIN32
+static volatile int s_w16p_mode = -1;
+static volatile LONG s_w16p_open = 0, s_w16p_wid = 0;
+static HANDLE s_w16p_th = 0;
+static DWORD WINAPI w16p_thread(LPVOID unused)
+{
+    (void)unused;
+    const char* fe = getenv("W16PROF_FILE"); FILE* f = fopen(fe && *fe ? fe : "w16prof.bin", "wb");
+    const char* ue = getenv("W16PROF_US"); int us = ue ? atoi(ue) : 250; if (us < 50) us = 50;
+    if (!f) { fprintf(stderr, "[W16PROF] cannot open output\n"); return 0; }
+    const ULONG_PTR base = (ULONG_PTR)GetModuleHandleA(NULL);
+    static uint32_t buf[1 << 20]; size_t bn = 0; unsigned long long ns = 0, nw = 0;
+    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    LARGE_INTEGER qf, qlast; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&qlast);
+    fprintf(stderr, "[W16PROF] v241A sampler on: mode %d, every %d us, timer %s\n", s_w16p_mode, us, tm ? "hi-res" : "Sleep(1)");
+    for (;;) {
+        if (tm) { LARGE_INTEGER due; due.QuadPart = -(LONGLONG)us * 10; SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE); WaitForSingleObject(tm, INFINITE); }
+        else Sleep(1);
+        const int open = s_w16p_open;
+        const int want = s_w16p_mode == 2 || (s_w16p_mode == 1 && open && s_w16p_wid == 16) || (s_w16p_mode == 3 && open);
+        if (want && s_w16p_th && bn + 80 < sizeof buf / sizeof buf[0]) {
+            CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            uint32_t fr[64]; int n = 0; const int wid = s_w16p_wid;
+            if (SuspendThread(s_w16p_th) != (DWORD)-1) {
+                if (GetThreadContext(s_w16p_th, &c)) {
+                    for (; n < 64; n++) {
+                        fr[n] = (uint32_t)(c.Rip - base);
+                        DWORD64 ib = 0; PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &ib, NULL);
+                        if (!rf) { if (n == 0 && c.Rsp) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; } n++; break; }
+                        void* hd = NULL; DWORD64 ef = 0;
+                        RtlVirtualUnwind(0 /* UNW_FLAG_NHANDLER */, ib, c.Rip, rf, &c, &hd, &ef, NULL);
+                        if (!c.Rip) { n++; break; }
+                    }
+                }
+                ResumeThread(s_w16p_th);
+            }
+            if (n > 0) { buf[bn++] = (uint32_t)n | ((uint32_t)((open ? 1 : 0) | ((wid & 0xFF) << 8)) << 16);
+                         for (int i = 0; i < n; i++) buf[bn++] = fr[i]; ns++; }
+        }
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        if (q.QuadPart - qlast.QuadPart >= qf.QuadPart * 10) {
+            if (bn) { fwrite(buf, 4, bn, f); fflush(f); nw += bn; }
+            fprintf(stderr, "[W16PROF] %llu samples so far (%llu words written)\n", ns, nw);
+            bn = 0; qlast = q;
+        }
+    }
+    return 0;
+}
+static void w16p_begin(int wid)
+{
+    if (__builtin_expect(s_w16p_mode < 0, 0)) {
+        const char* e = getenv("W16PROF"); s_w16p_mode = e ? atoi(e) : 0;
+    }
+    if (!s_w16p_mode) return;
+    if (!g_active_ctx || g_active_ctx->thread_id != 1) return;   /* the main guest thread */
+    if (!s_w16p_th) {
+        s_w16p_th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
+        if (s_w16p_th) CreateThread(NULL, 1u << 20, w16p_thread, NULL, 0, NULL);
+    }
+    s_w16p_wid = wid; s_w16p_open = 1;
+}
+static inline void w16p_end(void) { if (s_w16p_mode > 0 && g_active_ctx && g_active_ctx->thread_id == 1) s_w16p_open = 0; }
+#else
+static inline void w16p_begin(int wid) { (void)wid; }
+static inline void w16p_end(void) {}
+#endif
 void ps3_taskwait_begin(void)
 {
     bj_begin();   /* v202 */
@@ -3410,6 +3805,13 @@ void ps3_taskwait_begin(void)
     g_spurs_tw_open_us = t_tw_t0;
     t_tw_marked = 0; t_tw_k = 0; t_tw_adapt_scans = t_tw_adapt_pauses = 0;
     t_tw_wid = spu_laneprof_on() ? tw_wid_of_wait() : -1;   /* v97f [TWCUR] */
+    if (s_w16p_mode != 0) w16p_begin(t_tw_wid >= 0 ? t_tw_wid : tw_wid_of_wait());   /* v241A W16PROF */
+    if (t_tw_wid >= 0) {   /* v241A [TWSPLIT] */
+        if (!s_tws_lim) { LARGE_INTEGER f, q0, q1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0);
+            const unsigned long long c0 = __rdtsc(); do QueryPerformanceCounter(&q1); while (q1.QuadPart - q0.QuadPart < f.QuadPart / 100);
+            s_tws_lim = (__rdtsc() - c0) * (unsigned long long)f.QuadPart / (unsigned long long)(q1.QuadPart - q0.QuadPart) / 1000000ull * 6ull; }
+        t_tws_t0 = t_tws_last = __rdtsc(); t_tws_idle = 0; t_tws_w = t_tw_wid;
+    } else t_tws_t0 = 0;
     if (g_abx & 0x04) {   /* v132: mark the waited workload, wake its parked kernel at once */
         int w = t_tw_wid >= 0 ? t_tw_wid : tw_wid_of_wait();
         if (w < 0 || w > 16) w = 16;
@@ -3428,6 +3830,12 @@ void ps3_taskwait_begin(void)
 void ps3_taskwait_spin(void)
 {
     s_tw_spins++;
+    if (t_tws_t0) {   /* v241A [TWSPLIT] */
+        const unsigned long long n = __rdtsc();
+        if (n - t_tws_last <= s_tws_lim) t_tws_idle += n - t_tws_last;
+        tws_gap(n - t_tws_last);
+        t_tws_last = n;
+    }
     YieldProcessor();   /* the SMT sibling may be the lane we wait for */
     const unsigned k = ++t_tw_k;
     /* 64 list rescans retain the old low-latency path. Beyond that, stop
@@ -3459,6 +3867,7 @@ void ps3_taskwait_spin(void)
 }
 void ps3_taskwait_end(void)
 {
+    w16p_end();   /* v241A W16PROF */
     if (t_tw_bw >= 0) { InterlockedDecrement(&g_tw_wid_n[t_tw_bw]); t_tw_bw = -1; }   /* v132 */
     if (t_tw_marked & 1) InterlockedDecrement(&g_spurs_ppu_waiting);
     if (t_tw_marked & 2) InterlockedDecrement(&g_spurs_ppu_tw);
@@ -3475,6 +3884,12 @@ void ps3_taskwait_end(void)
     else { g_fr_tw_us[16] += d; g_fr_tw_n[16]++; }
     bj_end(d);   /* v202 */
     s_tw_n++; s_tw_us += d; if (d > s_tw_max) s_tw_max = d; if (d < 5) s_tw_fast++;
+    if (t_tws_t0 && t_tw_wid >= 0 && t_tw_wid <= 16) {   /* v241A [TWSPLIT]: the tail rescan before the end counts too */
+        const unsigned long long n = __rdtsc();
+        if (n - t_tws_last <= s_tws_lim) t_tws_idle += n - t_tws_last;
+        tws_gap(n - t_tws_last);
+        s_tws_idle[t_tw_wid] += (long long)t_tws_idle; s_tws_tot[t_tw_wid] += (long long)(n - t_tws_t0); t_tws_t0 = 0;
+    }
     if (t_tw_wid >= 0 && t_tw_wid <= 16) { const int w = t_tw_wid;   /* v97f [TWCUR] */
         s_tww_n[w]++; s_tww_us[w] += d; if (d >= 100) s_tww_long[w]++; if (d > s_tww_max[w]) s_tww_max[w] = d;
         /* v221A [TWTHR]: the same waits split by the WAITING thread (which of them is the main guest thread: match the
@@ -3508,6 +3923,24 @@ void ps3_taskwait_end(void)
                 s_tww_n[w] = s_tww_us[w] = s_tww_long[w] = s_tww_max[w] = 0;
             }
             if (p > 40) fprintf(stderr, "%s (ab %d)\n", b, g_ab_mask);
+            {   /* v241A [TWSPLIT] */
+                char c[768]; int q = snprintf(c, sizeof c, "[TWSPLIT] 10s idle re-polling share of each wait (rest = PPU work in the wait loop):");
+                for (int k = 0; k <= 16; k++) if (s_tws_tot[k] && q < (int)sizeof c - 48)
+                    q += snprintf(c + q, sizeof c - q, " w%d %.0f%% of %.0f ms", k, 100.0 * (double)s_tws_idle[k] / (double)s_tws_tot[k],
+                                  s_tws_lim ? (double)s_tws_tot[k] / ((double)s_tws_lim / 6.0) / 1000.0 : 0.0);
+                if (q > 90) fprintf(stderr, "%s\n", c);
+                memset(s_tws_idle, 0, sizeof s_tws_idle); memset(s_tws_tot, 0, sizeof s_tws_tot);
+                for (int k = 0; k <= 16; k++) {
+                    long long tn = 0; for (int b = 0; b < 9; b++) tn += s_tws_hn[k][b];
+                    if (tn < 100) continue;
+                    char h[512]; int r = snprintf(h, sizeof h, "[TWGAP] w%d rescan gaps (count / ms):", k);
+                    static const char* const bl[9] = { "<2", "<4", "<8", "<16", "<32", "<64", "<128", "<256", ">=256" };
+                    for (int b = 0; b < 9; b++) r += snprintf(h + r, sizeof h - r, " %sus %lld/%.0f", bl[b], s_tws_hn[k][b],
+                                                              s_tws_lim ? (double)s_tws_ht[k][b] / ((double)s_tws_lim / 6.0) / 1000.0 : 0.0);
+                    fprintf(stderr, "%s\n", h);
+                }
+                memset(s_tws_hn, 0, sizeof s_tws_hn); memset(s_tws_ht, 0, sizeof s_tws_ht);
+            }
         }
         {   /* v221A [TWTHR] per waiting thread, [KICK221] targeted kicks + ReadyCountStore calls per wid */
             const long nt = s_twt_used < TWT_N ? s_twt_used : TWT_N;
@@ -3722,7 +4155,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 int m = spurs_taskwait_mode();
                 tw_spin = m == 2 || (m == 1 && (int)(si - s_inst) == 0 && k_part == 0);
             }
-            if (!k_busy_pass && !tw_spin && (g_abx & 0x04))   /* v132: no nap while the PPU waits on one of OUR workloads */
+            if (!k_busy_pass && !tw_spin && (g_abx & 0x04) && !v242a_feat(&s_v242a_noboost, -1))   /* v132: no nap while the PPU waits on one of OUR workloads (v242A V242A_NOBOOST: nap) */
                 for (u32 w = 0; w < 16; w++) if (((k_owned >> w) & 1) && g_tw_wid_n[w] > 0) { tw_spin = 1; break; }
             const int k_hot = ((int)(si - s_inst) == 1 && k_part == 0 && spurs_inst1_hot());   /* v140 */
             /* v182 SPURS_INST1_NAP (default 0; 1 = v140 behaviour): the hot audio kernel never naps. perf182 heavy-action
@@ -3733,7 +4166,22 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             static int s_inst1_nap = -1;
             if (s_inst1_nap < 0) { const char* e = getenv("SPURS_INST1_NAP"); s_inst1_nap = (e && *e == '1') ? 1 : 0;
                                    fprintf(stderr, "[spurs-kern] v182 audio kernel naps: %s (SPURS_INST1_NAP)\n", s_inst1_nap ? "after 2 ms idle (old)" : "never (spin)"); }
-            if (k_hot && (k_busy_pass || !s_inst1_nap || now.QuadPart - t_last_busy < s_freq / 500)) {
+            const int k_lean = v241a_lean();   /* v241A */
+            {   /* v242A V242A_LLSPIN -> spu_channels.c */
+                extern volatile int g_v242a_llspin; extern volatile unsigned g_v242a_ll_cv, g_v242a_ll_y;
+                static int s_ll_init = 0;
+                if (__builtin_expect(!s_ll_init, 0)) { const char* a = getenv("V242A_LLSPIN_CV"); const char* b = getenv("V242A_LLSPIN_Y");
+                    g_v242a_ll_cv = (a && *a) ? (unsigned)atol(a) : 1000u; g_v242a_ll_y = (b && *b) ? (unsigned)atol(b) : 100u; s_ll_init = 1; }
+                const int ll = v242a_feat(&s_v242a_llspin, 0);   /* default 0 (b951 F +0.9, b953 FF with SERIAL -2.6 fps) */
+                if (g_v242a_llspin != ll) g_v242a_llspin = ll;
+            }
+            const int k_lean_aud = v242a_lean_bit(0x02), k_lean_spin = v242a_lean_bit(0x01);   /* v242A components (== k_lean by default) */
+            LONGLONG k_aud_t = k_lean_aud ? s_freq / 3333 : s_freq / 500;
+            if (k_hot && k_lean_aud && v242a_feat(&s_v242a_audspin, 0)) {   /* v242A V242A_AUDSPIN */
+                static LONGLONG s_as = -1; if (s_as < 0) { const char* e = getenv("V242A_AUDSPIN_US"); long us = e ? atol(e) : 50; if (us < 0) us = 0; s_as = (LONGLONG)us * s_freq / 1000000; }
+                k_aud_t = s_as;
+            }
+            if (k_hot && (k_busy_pass || (!s_inst1_nap && !k_lean_aud) || now.QuadPart - t_last_busy < k_aud_t)) {
                 if (k_busy_pass) t_last_busy = now.QuadPart;
                 else for (int z = 0; z < 32; z++) YieldProcessor();   /* idle: short PAUSE spin, keep the CPU */
             }
@@ -3748,7 +4196,19 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 const int ph = g_ab_mask; /* phase index 0..4 under PS3_AB, else 0 */
                 LONGLONG spin_t = (ph > 0 && ph < 5 && ab_spin[ph] >= 0) ? (LONGLONG)ab_spin[ph] * s_freq / 1000000 : s_spin_ticks;
                 if ((g_abx & 0x08) && spin_t > s_freq / 10000) spin_t = s_freq / 10000;   /* v132 ABX 0x08: kernel spin window 500 -> 100 us */
+                if (k_lean_spin) {   /* v241A lean: short kernel spin window (v242A: component 01) */
+                    static LONGLONG s_lean_t = -1;
+                    if (s_lean_t < 0) { const char* e = getenv("V241A_LEAN_SPIN_US"); long us = e ? atol(e) : 50; if (us < 0) us = 0; s_lean_t = (LONGLONG)us * s_freq / 1000000; }
+                    if (spin_t > s_lean_t) spin_t = s_lean_t;
+                }
                 LONGLONG wait_us = (ph > 0 && ph < 5 && ab_wait[ph] >= 0) ? ab_wait[ph] : s_wait_us;
+                if (k_lean && kick_slot >= 0 && v242a_feat(&s_v242a_nap, 0)) {   /* v242A V242A_NAP: long-idle kernels park longer (kick still wakes) */
+                    static LONGLONG s_nap_after = -1, s_nap_us = 1000;
+                    if (s_nap_after < 0) { const char* a = getenv("V242A_NAP_AFTER_US"); const char* u = getenv("V242A_NAP_US");
+                        long av = a ? atol(a) : 3000; if (av < 0) av = 0; s_nap_after = (LONGLONG)av * s_freq / 1000000;
+                        if (u) s_nap_us = atol(u); if (s_nap_us < 0) s_nap_us = 0; if (s_nap_us > 16000) s_nap_us = 16000; }
+                    if (now.QuadPart - t_last_busy >= s_nap_after && wait_us < s_nap_us) wait_us = s_nap_us;
+                }
                 if (now.QuadPart - t_last_busy < spin_t) SwitchToThread();
 #ifdef _WIN32
                 else if (kick_slot >= 0 && wait_us > 0) {
@@ -4162,6 +4622,7 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
     *(vm_base + (u32)(uintptr_t)spurs + SPURS_WKL_READY1 + wid) = (u8)value;
     if (wid < 16) {   /* v221A V221A_RCS: the kernel that owns wid sees the new ready count now, not after its nap */
         InterlockedIncrement(&s_rcs_n[wid]);
+        if ((int)wid == bjc_wid() && bj_on() && bjev_on()) { const unsigned long long t = __rdtsc(); bjev_add(t, t, -1, (int)value, 2); }   /* v241A */
         if (value && v221a_on() && v221a_env(2)) { const long k = ps3_spurs_kick_wid((int)wid); if (k) InterlockedExchangeAdd(&s_rcs_woke, k); }
     }
     {   static int _n = 0;
@@ -4380,7 +4841,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     {   static int spin_us = -1;
         if (spin_us < 0) { const char* e = getenv("SPURS_EF_SPIN_US"); spin_us = e ? atoi(e) : 500; if (spin_us < 0) spin_us = 0;
                            fprintf(stderr, "[cellSpurs] v111 EventFlagWait: spin up to %d us on the flag word before the CV wait (SPURS_EF_SPIN_US)\n", spin_us); }
-        if (spin_us > 0) {
+        if (spin_us > 0 && !v242a_lean_bit(0x10)) {   /* v241A lean: no pre-spin (v242A: component 10) */
             LARGE_INTEGER sf, st0, st; QueryPerformanceFrequency(&sf); QueryPerformanceCounter(&st0);
             const long long lim = (long long)sf.QuadPart * spin_us / 1000000;
             for (unsigned it = 0;; it++) {

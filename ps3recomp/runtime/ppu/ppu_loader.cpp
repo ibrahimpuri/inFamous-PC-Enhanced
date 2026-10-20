@@ -3821,11 +3821,38 @@ static void telem_cpu_report(double win_ms)
  * threads cannot push it onto an E-core or preempt it. No-op on non-hybrid CPUs except
  * the priority. */
 #ifdef _WIN32
+/* v242B ps3_host_ncpu(): logical CPUs this process may run on = popcount of the process affinity mask (re-read at
+ * most every 2 s: bench_drive / the user may change the mask after start). PS3_NCPU=<n> overrides (testing).
+ * Used for the CPU-count auto rules of the host threads (VTX_ASYNC workers ...). */
+extern "C" int ps3_host_ncpu(void)
+{
+    static volatile LONG s_n = 0; static volatile ULONGLONG s_t = 0; static int s_env = -2;
+    if (s_env == -2) { const char* e = getenv("PS3_NCPU"); s_env = (e && *e) ? atoi(e) : -1; }
+    if (s_env > 0) return s_env;
+    const ULONGLONG now = GetTickCount64();
+    if (!s_n || now - s_t >= 2000) {
+        DWORD_PTR pm = 0, sm = 0; int n = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm) n = (int)__builtin_popcountll((unsigned long long)pm);
+        else { SYSTEM_INFO si; GetSystemInfo(&si); n = (int)si.dwNumberOfProcessors; }
+        if (n < 1) n = 1;
+        s_n = n; s_t = now;
+    }
+    return (int)s_n;
+}
 extern "C" void ps3_thread_prefer_pcores(const char* who, int prio)
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("PS3_PCORE"); on = (e && *e == '0') ? 0 : 1; }
     if (!on) return;
+    /* v242B PS3_PCORE_MIN (default 8; 0 = old rule): restrict to the performance cores only when the process affinity
+     * holds at least that many P-core logical CPUs AND some other ones. A weak hybrid laptop (e.g. 2P+8E = 4 P logical
+     * CPUs) otherwise crams the main/FIFO/SPURS/16 sound threads onto 4 CPUs while 8 E-cores idle; with an affinity
+     * that is all P-cores the restriction is a no-op anyway. 28-CPU 14700F: 16 P + 12 E in the mask -> unchanged. */
+    static int s_pmin = -1;
+    if (s_pmin < 0) { const char* e = getenv("PS3_PCORE_MIN"); s_pmin = (e && *e) ? atoi(e) : 8; if (s_pmin < 0) s_pmin = 0; }
+    DWORD_PTR v242b_pm = 0, v242b_sm = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &v242b_pm, &v242b_sm)) v242b_pm = 0;
+    int v242b_skip = 0, v242b_pin = 0, v242b_oin = 0;
     typedef BOOL (WINAPI *GSCSI)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
     typedef BOOL (WINAPI *STSCS)(HANDLE, const ULONG*, ULONG);
     HMODULE k = GetModuleHandleA("kernel32.dll");
@@ -3843,7 +3870,16 @@ extern "C" void ps3_thread_prefer_pcores(const char* who, int prio)
                 o += c->Size;
             }
             ULONG ids[256];
-            if (maxc != minc) {
+            if (maxc != minc && s_pmin > 0 && v242b_pm) {   /* v242B: P / other logical CPUs inside the process affinity */
+                for (ULONG o = 0; o < len; ) {
+                    PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(buf + o);
+                    if (c->Type == CpuSetInformation && c->CpuSet.Group == 0 && c->CpuSet.LogicalProcessorIndex < 8 * sizeof(DWORD_PTR) &&
+                        ((v242b_pm >> c->CpuSet.LogicalProcessorIndex) & 1)) { if (c->CpuSet.EfficiencyClass == maxc) v242b_pin++; else v242b_oin++; }
+                    o += c->Size;
+                }
+                if (v242b_pin < s_pmin || v242b_oin == 0) v242b_skip = 1;
+            }
+            if (maxc != minc && !v242b_skip) {
                 for (ULONG o = 0; o < len; ) {
                     PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(buf + o);
                     if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass == maxc && npc < 256) ids[npc++] = c->CpuSet.Id;
@@ -3855,6 +3891,10 @@ extern "C" void ps3_thread_prefer_pcores(const char* who, int prio)
         free(buf);
     }
     if (prio) SetThreadPriority(GetCurrentThread(), prio);
+    if (v242b_skip)
+        fprintf(stderr, "[PCORE] %s thread (hosttid %lu): v242B no P-core restriction: affinity holds %d P-core + %d other logical CPUs (PS3_PCORE_MIN %d), priority %d%c",
+                who, (unsigned long)GetCurrentThreadId(), v242b_pin, v242b_oin, s_pmin, prio, 10);
+    else
     fprintf(stderr, "[PCORE] %s thread (hosttid %lu): %d of %d logical CPUs are performance cores%s, priority %d%c",
             who, (unsigned long)GetCurrentThreadId(), npc, ntot, npc ? " -> restricted to them" : " (not hybrid)", prio, 10);
 }
@@ -3929,32 +3969,64 @@ static DWORD WINAPI main_core_thread(LPVOID)
             last_scan = now;
             static unsigned s_scans = 0;
             if ((++s_scans % 10) == 0) for (int q = 0; q < nt; q++) seen[q] = 0;   /* re-apply all every ~10 s (tid reuse) */
+            int nthr = 0;
+            /* one thread of this process: tid, and a SET|QUERY handle when the enumeration already has one (else NULL) */
+            auto visit = [&](DWORD tid, HANDLE hk) {
+                if (tid == self) return;
+                int slot = 0; while (slot < n && s_mc_tid[slot] != tid) slot++;
+                if (slot < n) return;
+                nthr++;
+                int i = 0; while (i < nt && tids[i] != tid) i++;
+                if (i < nt && seen[i] && lastm[i] == active) return;
+                HANDLE h = hk ? hk : OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, tid);
+                if (!h) { nfail++; return; }
+                if (i >= nt) {   /* first touch: remember the thread's own mask */
+                    if (nt >= NT) { nt = 0; i = 0; }   /* table full (thread churn): start over */
+                    i = nt++; tids[i] = tid;
+                    DWORD_PTR p = SetThreadAffinityMask(h, s_mc_proc);
+                    orig[i] = p ? p : s_mc_proc;
+                }
+                DWORD_PTR m = orig[i] & ~active;
+                if (!m) m = orig[i];   /* a thread pinned INSIDE a reserved core keeps its pin */
+                if (SetThreadAffinityMask(h, m)) nset++; else nfail++;
+                lastm[i] = active; seen[i] = 1;
+                if (!hk) CloseHandle(h);
+            };
+            /* v242B V242B_MC_ENUM (default 1; 0 = old): walk only THIS process's threads with NtGetNextThread instead of a
+             * Toolhelp snapshot of every thread in the system (Thread32Next maps the snapshot per call: b931/b933 this
+             * thread burnt 10-11 % of a core at one scan per second). Same threads, same masks, same order of effects. */
+            typedef LONG (NTAPI *NtGNT)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
+            static NtGNT s_gnt = NULL; static int s_mc_enum = -1, s_mc_enum_ph = -1;
+            if (s_mc_enum < 0) {
+                const char* e = getenv("V242B_MC_ENUM"); s_mc_enum = (e && *e == '0') ? 0 : 1;
+                e = getenv("V242B_MC_ENUM_PHASE"); s_mc_enum_ph = (e && *e) ? (atoi(e) & 1) : -1;   /* in-run A/B */
+                if (s_mc_enum) s_gnt = (NtGNT)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtGetNextThread");
+                if (!s_gnt) s_mc_enum = 0;
+                fprintf(stderr, "[MAINCORE] v242B thread scan: %s (V242B_MC_ENUM=0 = Toolhelp snapshot)\n", s_mc_enum ? "NtGetNextThread (own threads only)" : "Toolhelp snapshot");
+            }
+            bool scanned = false;
+            if (s_mc_enum && (s_mc_enum_ph < 0 || (g_ab_phase & 1) == s_mc_enum_ph)) {
+                HANDLE cur = NULL, nx = NULL;
+                while (s_gnt(GetCurrentProcess(), cur, THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, 0, 0, &nx) == 0) {
+                    if (cur) CloseHandle(cur);
+                    cur = nx; nx = NULL;
+                    visit(GetThreadId(cur), cur);
+                }
+                if (cur) CloseHandle(cur);
+                scanned = true;
+            } else {
             HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             if (snap != INVALID_HANDLE_VALUE) {
                 THREADENTRY32 te; te.dwSize = sizeof te;
-                int nthr = 0;
                 for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-                    if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-                    int slot = 0; while (slot < n && s_mc_tid[slot] != te.th32ThreadID) slot++;
-                    if (slot < n) continue;
-                    nthr++;
-                    int i = 0; while (i < nt && tids[i] != te.th32ThreadID) i++;
-                    if (i < nt && seen[i] && lastm[i] == active) continue;
-                    HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-                    if (!h) { nfail++; continue; }
-                    if (i >= nt) {   /* first touch: remember the thread's own mask */
-                        if (nt >= NT) { nt = 0; i = 0; }   /* table full (thread churn): start over */
-                        i = nt++; tids[i] = te.th32ThreadID;
-                        DWORD_PTR p = SetThreadAffinityMask(h, s_mc_proc);
-                        orig[i] = p ? p : s_mc_proc;
-                    }
-                    DWORD_PTR m = orig[i] & ~active;
-                    if (!m) m = orig[i];   /* a thread pinned INSIDE a reserved core keeps its pin */
-                    if (SetThreadAffinityMask(h, m)) nset++; else nfail++;
-                    lastm[i] = active; seen[i] = 1;
-                    CloseHandle(h);
+                    if (te.th32OwnerProcessID != pid) continue;
+                    visit(te.th32ThreadID, NULL);
                 }
                 CloseHandle(snap);
+                scanned = true;
+            }
+            }
+            if (scanned) {
                 if (active != last_active) {
                     fprintf(stderr, "[MAINCORE] reserved cores now 0x%llX: %d other threads kept off them (set %llu, failed %llu)\n",
                             (unsigned long long)active, nthr, nset, nfail);
@@ -4023,6 +4095,15 @@ static int mc_reserve_for_current_thread(const char* who, int abph, int abx)
     GSCSI gs = k ? (GSCSI)GetProcAddress(k, "GetSystemCpuSetInformation") : NULL;
     DWORD_PTR pm = 0, sm = 0;
     if (!gs || !GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) || !pm) { fprintf(stderr, "[MAINCORE] unavailable (no CPU set info)\n"); return 0; }
+    /* v242B PS3_MAINCORE_MIN_CPUS (default 20; 0 = old rule only): no exclusive physical cores when the process may use
+     * fewer logical CPUs. In-run A/B, main-thread reservation lifted vs kept: 8 CPUs (b988) +3.1 fps (+6 %), lows +2.4/+2.2;
+     * 12 CPUs (b989) +6.0 fps (+13 %), lows +6.8/+6.3; 16 CPUs (b991) +8.1 fps (+23 %), lows +5.3/+5.2 (the reserved
+     * cores' SMT siblings idle while ~100 threads share the rest); 28 CPUs (b993) the reservation still WINS
+     * (+1.7 fps, lows +3.1/+2.5) -> unchanged on the 28-CPU PC. */
+    { static int s_minc = -1;
+      if (s_minc < 0) { const char* e = getenv("PS3_MAINCORE_MIN_CPUS"); s_minc = (e && *e) ? atoi(e) : 20; if (s_minc < 0) s_minc = 0; }
+      const int ncpu = (int)__builtin_popcountll((unsigned long long)pm);
+      if (ncpu < s_minc) { fprintf(stderr, "[MAINCORE] v242B not used for %s: %d logical CPUs in the affinity < PS3_MAINCORE_MIN_CPUS %d\n", who, ncpu, s_minc); return 0; } }
     ULONG len = 0; gs(NULL, 0, &len, GetCurrentProcess(), 0);
     unsigned char* buf = (unsigned char*)malloc(len ? len : 1);
     if (!buf || !gs((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) { free(buf); fprintf(stderr, "[MAINCORE] unavailable\n"); return 0; }
@@ -4097,6 +4178,11 @@ static ProfTable s_pt_task; static HANDLE s_prof_task_h = NULL;
 /* v138: the SPURS instance-1 kernel thread (w3 BrBDblBufWrkld, ~93% busy in heavy scenes, suspected audio producer)
  * in a table of its own ("w3"), sampled every tick even with PS3_PROF_MAIN_ONLY=1. */
 static ProfTable s_pt_w3; static HANDLE s_prof_w3_h = NULL;
+/* v241B PS3_PROF_INWAIT=1: a second main-thread table ("mainw") sampled only while a PPU task wait is open
+ * (g_spurs_tw_open_us != 0, cellSpurs.c ps3_taskwait_begin/end) -- what the main thread does INSIDE the waits
+ * (the w16 per-item update chain in func_00287058). Diagnostic only. */
+static ProfTable s_pt_mainw; static int s_prof_inwait = 0;
+extern "C" volatile long long g_spurs_tw_open_us;
 extern "C" void ps3_prof_register_inst1_thread(void)
 {
     const char* e = getenv("PS3_PROF_MAIN");
@@ -4435,6 +4521,8 @@ static DWORD WINAPI prof_main_thread(LPVOID p)
     const uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
     const PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew);
     const uintptr_t lim = base + nt->OptionalHeader.SizeOfImage;
+    s_pt_mainw.name = "mainw"; { const char* e = getenv("PS3_PROF_INWAIT"); s_prof_inwait = (e && *e == '1');
+      if (s_prof_inwait) fprintf(stderr, "[PROF] v241B: main thread inside task waits sampled as \"mainw\" (PS3_PROF_INWAIT)\n"); }
     s_pt_main.name = "main"; s_pt_spu.name = "spu"; s_pt_fifo.name = "fifo"; s_pt_task.name = "task"; s_pt_w3.name = "w3";
     { const char* e = getenv("PS3_PROF_WID");   /* v147 */
       if (e && *e && *e != '-') { int w = atoi(e); if (w >= 0 && w < 16) {
@@ -4447,6 +4535,7 @@ static DWORD WINAPI prof_main_thread(LPVOID p)
     for (;;) {
         Sleep(ms);
         prof_sample(s_prof_main_h, &s_pt_main, base, lim);
+        if (s_prof_inwait && g_spurs_tw_open_us) prof_sample(s_prof_main_h, &s_pt_mainw, base, lim);   /* v241B */
         if (s_prof_task_h) prof_sample(s_prof_task_h, &s_pt_task, base, lim);   /* v109 */
         if (s_prof_w3_h) prof_sample(s_prof_w3_h, &s_pt_w3, base, lim);         /* v138 */
         if (s_prof_wid >= 0) {                                                  /* v147 PS3_PROF_WID */
@@ -4463,6 +4552,7 @@ static DWORD WINAPI prof_main_thread(LPVOID p)
             prof_report(&s_pt_main, main_only ? 24 : 120);
             if (s_pt_task.tot) prof_report(&s_pt_task, 100);   /* v109 */
             if (s_pt_w3.tot) prof_report(&s_pt_w3, 100);       /* v138 */
+            if (s_pt_mainw.tot) prof_report(&s_pt_mainw, 120); /* v241B */
             if (s_pt_wid.tot) prof_report(&s_pt_wid, 100);     /* v147 */
             if (!main_only) {
             prof_report(&s_pt_fifo, 400);
@@ -4488,6 +4578,7 @@ extern "C" void ps3_prof_main_start(void)
     fprintf(stderr, "[PROF] sampling the main guest thread every %u ms (v62)\n", ms);
 }
 #else
+extern "C" int ps3_host_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }   /* v242B */
 extern "C" void ps3_thread_prefer_pcores(const char* who, int prio) { (void)who; (void)prio; }
 extern "C" void ps3_thread_pcore_set(const char* who, int want, int prio) { (void)who; (void)want; (void)prio; }
 extern "C" void ps3_prof_main_start(void) {}
@@ -4508,6 +4599,18 @@ extern "C" { volatile int g_ab_mask = 0; }
 /* Monotonic A/B phase index, separate from the legacy phase mask. Experiments
  * that must not perturb any legacy mask/ABX feature can key off this value. */
 extern "C" { volatile int g_ab_phase = 0; }
+/* v241B PPU_VR / PPU_VR_PHASE: selector of the --vr-ab twins (tools/ppu_regcache_v241.py, CMake PORT_PPU_VR=AB) --
+ * VMX-register-cached (new) vs v103 code (old) copies of the hot lifted functions. -1 = new, 2 = old,
+ * 0/1 = new only in PS3_AB phases of that parity. Builds without the twins never read it. */
+static int v241_vrsel_init(void)
+{
+    const char* e = getenv("PPU_VR");
+    if (e && *e == '0') return 2;
+    const char* ph = getenv("PPU_VR_PHASE");
+    if (ph && (*ph == '0' || *ph == '1')) return *ph - '0';
+    return -1;
+}
+extern "C" { int g_v241_vrsel = v241_vrsel_init(); }
 /* v132 PS3_ABX_SEQ=<x,x,...> (up to 64 entries, decimal or 0x hex): FACTORIAL in-run A/B. Each phase sets the experiment
  * BITMASK g_abx (one bit per independent experiment; g_ab_mask stays at its own PS3_AB_SEQ value, default 0), so k
  * experiments are tested together and each bit's effect is the mean over all phases with the bit on vs off.

@@ -26,7 +26,7 @@ static u32 s_gcm_context_ea = 0;
 #include <time.h>   /* v50 semaphore acquire timeout */
 #include <stdlib.h>
 #include <stdint.h>
-#if defined(_M_X64) || defined(__x86_64__)
+#if (defined(_M_X64) || defined(__x86_64__)) && defined(__AVX2__)   /* v242B: AVX2 builds only (PORT_CPU_COMPAT -> per-word loop) */
 #include <immintrin.h>   /* v221C TC_VEC */
 #define GCM_TC_VEC_X86 1
 #endif

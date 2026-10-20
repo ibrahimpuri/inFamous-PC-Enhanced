@@ -1117,7 +1117,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   __thread
 #endif
                   int g_spu_async_task_tls;
-                  const uint32_t cv_at = (s_fw && g_spu_async_task_tls) ? 256u : 50000u;
+                  uint32_t cv_at = (s_fw && g_spu_async_task_tls) ? 256u : 50000u;
+                  /* v242A V242A_LLSPIN (cellSpurs.c sets g_v242a_llspin; 0 = old): with scarce CPUs an SPU poll loop on
+                   * an unchanged line goes to the notify-woken CV wait after g_v242a_ll_cv identical polls (old 50000)
+                   * and yields after g_v242a_ll_y (old 2000). Same wake source (coherency notify), 1 ms cap. */
+                  extern volatile int g_v242a_llspin; extern volatile unsigned g_v242a_ll_cv, g_v242a_ll_y;
+                  uint32_t y_at = 2000u;
+                  if (g_v242a_llspin) { if (cv_at > g_v242a_ll_cv) cv_at = g_v242a_ll_cv; y_at = g_v242a_ll_y; }
                   /* v116 SPU_TASK_HOT_US (default 2000; 0 = off): on the async SPU task thread, keep polling at full
                    * speed (PAUSE only, no sleep) for this long after the polled line last changed. play115 FTL:
                    * every FIOS request took 1.2-1.8 ms from the PPU's LFQueue push to the task's "done" PUTLLC,
@@ -1149,7 +1155,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       }
                       spu_lp_raw_end(lpb, LP_BACKOFF);
                   }
-                  else if (t_bsame >= 2000) { uint64_t lpb = spu_lp_raw_begin(); SwitchToThread(); spu_lp_raw_end(lpb, LP_BACKOFF); }
+                  else if (t_bsame >= y_at) { uint64_t lpb = spu_lp_raw_begin(); SwitchToThread(); spu_lp_raw_end(lpb, LP_BACKOFF); }   /* v242A: y_at = 2000 unless V242A_LLSPIN */
               } else {
                   t_bea = ea; t_bsame = 0;
                   memcpy(t_bline, ctx->resv_line, MFC_ATOMIC_LINE);
@@ -4311,6 +4317,8 @@ void spu_miss_stats_record(int img, int ovl, uint32_t pc, double ms)
 
 /* v30c: GETLLARs that re-read an unchanged line (= polling/waiting, not compute); per host thread. */
 SPU_THREAD_LOCAL unsigned long long g_spu_spin_polls = 0;
+volatile int g_v242a_llspin = 0;                                  /* v242A V242A_LLSPIN, set by cellSpurs.c (0 = old) */
+volatile unsigned g_v242a_ll_cv = 50000u, g_v242a_ll_y = 2000u;   /* v242A thresholds (cellSpurs.c sets them) */
 SPU_THREAD_LOCAL spu_laneprof_tls g_spu_lp;   /* v96a [LANEPROF] */
 
 /* v102 SPU_DMA_FAST (spu_dma.h mfc_do_transfer_fast / mfc_submit): on unless SPU_DMA_FAST=0 or

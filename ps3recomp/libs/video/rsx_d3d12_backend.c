@@ -12463,14 +12463,58 @@ static int va_take(void)   /* claim + run one job; 0 if nothing claimable */
     InterlockedIncrement(&s_va_done);
     return 1;
 }
+/* v242B VTX_ASYNC_LEAN (default ON; 0 = off = old; VTX_ASYNC_LEAN_PHASE=0|1 = only in PS3_AB phases of that parity ->
+ * in-run A/B). b981 (8 CPUs): +1.65 fps, -39 % process CPU; b982 (28 CPUs, spin only): +2.1 fps, 1 % / 0.1 % lows +4.4 /
+ * +4.9, -30 % process CPU -> on for every CPU count. b931/b933: the 3 workers burn
+ * 50 % (28 CPUs) / 26 % (8 CPUs) of a core, mostly in the 4000-PAUSE spin after every job (~12k jobs/s spread over the
+ * frame, "0 waiting syncs" = the FIFO thread never waits for them). Lean: only VTX_ASYNC_LEAN_WORKERS workers take jobs
+ * (default 1 at <= 4 CPUs, 2 at <= 11, else all; the others park in Sleep(10)) and the idle spin is
+ * VTX_ASYNC_LEAN_SPIN pauses (default 200) before the event wait. Same jobs, same conversion code, same syncs (the RSX
+ * thread still helps in rsx_vtx_sync) -> identical output. Off: every worker active, 4000 pauses = exactly the old loop. */
+static volatile int s_va_active = 64, s_va_spin = 4000;
+static volatile LONG s_va_idx = 0;
+extern int ps3_host_ncpu(void);   /* ppu_loader.cpp */
+static void va_lean_tick(void)
+{
+    static int s_mode = -2, s_phase = -2, s_wk = -1, s_sp = -1, s_last = -1;
+    static ULONGLONG s_t = 0;
+    if (s_mode == -2) {
+        const char* e = getenv("VTX_ASYNC_LEAN"); s_mode = (e && *e) ? atoi(e) : -1;
+        e = getenv("VTX_ASYNC_LEAN_PHASE"); s_phase = (e && *e) ? (atoi(e) & 1) : -1;
+        e = getenv("VTX_ASYNC_LEAN_WORKERS"); s_wk = (e && *e) ? atoi(e) : -1;
+        e = getenv("VTX_ASYNC_LEAN_SPIN"); s_sp = (e && *e) ? atoi(e) : 200; if (s_sp < 1) s_sp = 1;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (s_last >= 0 && now - s_t < 250) return;
+    s_t = now;
+    extern volatile int g_ab_phase;
+    const int ncpu = ps3_host_ncpu();
+    int on = (s_mode == 0) ? 0 : 1;   /* v242B: default on (was: auto < 16 CPUs in b981/b982) */
+    if (on && s_phase >= 0 && (g_ab_phase & 1) != s_phase) on = 0;
+    int act = s_va_n > 0 ? s_va_n : 1, spin = 4000;
+    if (on) {
+        int w = s_wk > 0 ? s_wk : (ncpu <= 4 ? 1 : ncpu <= 11 ? 2 : act);
+        if (w > act) w = act;
+        if (w < 1) w = 1;
+        act = w; spin = s_sp;
+    }
+    const int key = on ? (act << 16) | (spin & 0xFFFF) : 0;
+    if (key != s_last) {
+        s_va_active = act; s_va_spin = spin; s_last = key;
+        fprintf(stderr, "[VTX_ASYNC] v242B lean %s: %d of %d workers take jobs, idle spin %d pauses (ncpu %d, ab phase %d)%c",
+                on ? "ON" : "off", act, s_va_n, spin, ncpu, (int)g_ab_phase, 10);
+    }
+}
 static DWORD WINAPI va_thread(LPVOID p)
 {
     (void)p;
+    const int idx = (int)InterlockedIncrement(&s_va_idx) - 1;   /* v242B */
     fprintf(stderr, "[THREADS] vertex worker hosttid=%lu%c", (unsigned long)GetCurrentThreadId(), 10);
     for (;;) {
+        if (idx >= s_va_active) { Sleep(10); continue; }   /* v242B lean: parked worker */
         if (va_take()) { if (s_va_sleep > 0 && s_va_claim < s_va_sub) SetEvent(s_va_ev); continue; }
-        int it = 0;
-        while (s_va_claim >= s_va_sub && ++it < 4000) YieldProcessor();
+        int it = 0; const int spin = s_va_spin;
+        while (s_va_claim >= s_va_sub && ++it < spin) YieldProcessor();
         if (s_va_claim < s_va_sub) continue;
         InterlockedIncrement(&s_va_sleep);
         if (s_va_claim >= s_va_sub) WaitForSingleObject(s_va_ev, 2);
@@ -12494,6 +12538,7 @@ static int va_on(void)
     s_va_n = made;
     if (made > 0) { extern void (*g_rsx_vtx_sync)(void); g_rsx_vtx_sync = rsx_vtx_sync; }
     fprintf(stderr, "[VTX_ASYNC] %d vertex conversion workers%c", made, 10);
+    if (made > 0) va_lean_tick();   /* v242B */
     return s_va_n;
 }
 /* Millions of tiny draws were each paying for a plan copy, an interlocked ring
@@ -12529,6 +12574,7 @@ void rsx_vtx_sync(void)
 static int va_submit(const u32* list, u32 first, u32 n, VPSlot* out)
 {
     if (va_on() <= 0 || !n) return 0;
+    { static u32 s_k = 0; if (((++s_k) & 255u) == 0) va_lean_tick(); }   /* v242B */
     if (n < va_min()) return 0;
     if (s_va_plan_n >= VA_PLANS || (u32)(s_va_sub - s_va_done) + n / VA_CHUNK + 2 >= VA_JOBS ||
         (list && s_va_arena_used + n > VA_ARENA)) rsx_vtx_sync();
@@ -12655,16 +12701,29 @@ static void read_guest_indices(const rsx_state* st, u32 first, u32 n, u32* dst)
         const __m128i sw16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
         for (; j + 8 <= n; j += 8) {
             const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(q + (size_t)j * 2)), sw16);
+#if defined(__AVX2__)
             _mm256_storeu_si256((__m256i*)(dst + j), _mm256_cvtepu16_epi32(v));
+#else   /* v242B PORT_CPU_COMPAT (no AVX2): same 8 words, two SSE4.1 halves */
+            _mm_storeu_si128((__m128i*)(dst + j), _mm_cvtepu16_epi32(v));
+            _mm_storeu_si128((__m128i*)(dst + j + 4), _mm_cvtepu16_epi32(_mm_srli_si128(v, 8)));
+#endif
         }
         for (; j < n; j++) dst[j] = ((u32)q[(size_t)j * 2] << 8) | q[(size_t)j * 2 + 1];
     } else {
         const u8* q = p + (u64)first * 4;
         u32 j = 0;
+#if defined(__AVX2__)
         const __m256i sw32 = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
                                               3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
         for (; j + 8 <= n; j += 8)
             _mm256_storeu_si256((__m256i*)(dst + j), _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i*)(q + (size_t)j * 4)), sw32));
+#else   /* v242B PORT_CPU_COMPAT (no AVX2) */
+        const __m128i sw32 = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+        for (; j + 8 <= n; j += 8) {
+            _mm_storeu_si128((__m128i*)(dst + j), _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(q + (size_t)j * 4)), sw32));
+            _mm_storeu_si128((__m128i*)(dst + j + 4), _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(q + (size_t)j * 4 + 16)), sw32));
+        }
+#endif
         for (; j < n; j++) { u32 w; memcpy(&w, q + (size_t)j * 4, 4); dst[j] = __builtin_bswap32(w); }
     }
 }
@@ -13974,10 +14033,18 @@ static inline void vc_minmax_u32(const u32* L, u32 n, u32* pmn, u32* pmx)
 {
     u32 mn = 0xFFFFFFFFu, mx = 0, j = 0;
     if (n >= 16) {
+#if defined(__AVX2__)
         __m256i vmn = _mm256_set1_epi32(-1), vmx = _mm256_setzero_si256();
         for (; j + 8 <= n; j += 8) { const __m256i v = _mm256_loadu_si256((const __m256i*)(L + j));
             vmn = _mm256_min_epu32(vmn, v); vmx = _mm256_max_epu32(vmx, v); }
         u32 a[8], b[8]; _mm256_storeu_si256((__m256i*)a, vmn); _mm256_storeu_si256((__m256i*)b, vmx);
+#else   /* v242B PORT_CPU_COMPAT (no AVX2): same min/max, SSE4.1 */
+        __m128i vmn0 = _mm_set1_epi32(-1), vmx0 = _mm_setzero_si128(), vmn1 = vmn0, vmx1 = vmx0;
+        for (; j + 8 <= n; j += 8) { const __m128i v0 = _mm_loadu_si128((const __m128i*)(L + j)), v1 = _mm_loadu_si128((const __m128i*)(L + j + 4));
+            vmn0 = _mm_min_epu32(vmn0, v0); vmx0 = _mm_max_epu32(vmx0, v0); vmn1 = _mm_min_epu32(vmn1, v1); vmx1 = _mm_max_epu32(vmx1, v1); }
+        u32 a[8], b[8]; _mm_storeu_si128((__m128i*)a, vmn0); _mm_storeu_si128((__m128i*)(a + 4), vmn1);
+        _mm_storeu_si128((__m128i*)b, vmx0); _mm_storeu_si128((__m128i*)(b + 4), vmx1);
+#endif
         for (int k = 0; k < 8; k++) { mn = a[k] < mn ? a[k] : mn; mx = b[k] > mx ? b[k] : mx; }
     }
     for (; j < n; j++) { const u32 v = L[j]; mn = v < mn ? v : mn; mx = v > mx ? v : mx; }
@@ -13986,8 +14053,16 @@ static inline void vc_minmax_u32(const u32* L, u32 n, u32* pmn, u32* pmx)
 static inline void vc_ib_fill(u32* ib, const u32* L, u32 n, u32 add)
 {
     u32 j = 0;
+#if defined(__AVX2__)
     const __m256i va = _mm256_set1_epi32((int)add);
     for (; j + 8 <= n; j += 8) _mm256_storeu_si256((__m256i*)(ib + j), _mm256_add_epi32(_mm256_loadu_si256((const __m256i*)(L + j)), va));
+#else   /* v242B PORT_CPU_COMPAT (no AVX2) */
+    const __m128i va = _mm_set1_epi32((int)add);
+    for (; j + 8 <= n; j += 8) {
+        _mm_storeu_si128((__m128i*)(ib + j), _mm_add_epi32(_mm_loadu_si128((const __m128i*)(L + j)), va));
+        _mm_storeu_si128((__m128i*)(ib + j + 4), _mm_add_epi32(_mm_loadu_si128((const __m128i*)(L + j + 4)), va));
+    }
+#endif
     for (; j < n; j++) ib[j] = L[j] + add;
 }
 /* v219i VC_SEQ (default 1; 0 = off; ABX 0x10000000 = off for in-run A/B): latency hiding by FRAME ORDER. The FIFO
@@ -15131,6 +15206,7 @@ static void d3d12_draw_indexed_one(void* ud, u32 primitive, u32 first, u32 count
             _Static_assert(sizeof(dr->tex[0]) == 40 && sizeof(s_d3d.cur_texs[0]) == 44, "tex layouts");
             const u32* src = (const u32*)&s_d3d.cur_texs[0];
             u32* dst = (u32*)&dr->tex[0];
+#if defined(__AVX2__)
             const __m256i neg1 = _mm256_set1_epi32(-1);
             for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++, src += 11, dst += 10) {
                 __m256i v = _mm256_loadu_si256((const __m256i*)src);
@@ -15140,6 +15216,17 @@ static void d3d12_draw_indexed_one(void* ud, u32 primitive, u32 first, u32 count
             }
             _mm256_storeu_si256((__m256i*)&dr->tex_rt[0], neg1);
             _mm256_storeu_si256((__m256i*)&dr->tex_rt[8], neg1);
+#else       /* v242B PORT_CPU_COMPAT (no AVX2): the same words with SSE4.1 */
+            const __m128i neg1 = _mm_set1_epi32(-1);
+            for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++, src += 11, dst += 10) {
+                const __m128i lo = _mm_loadu_si128((const __m128i*)src);
+                const __m128i hi = _mm_insert_epi32(_mm_loadu_si128((const __m128i*)(src + 4)), (int)src[10], 3);
+                _mm_storeu_si128((__m128i*)dst, lo);
+                _mm_storeu_si128((__m128i*)(dst + 4), hi);
+                dst[8] = src[7]; dst[9] = src[8];
+            }
+            for (int _k = 0; _k < 16; _k += 4) _mm_storeu_si128((__m128i*)&dr->tex_rt[_k], neg1);
+#endif
         } else
         for (int _u = 0; _u < RSX_D3D_TEX_UNITS; _u++) {
             dr->tex[_u].off = s_d3d.cur_texs[_u].off;

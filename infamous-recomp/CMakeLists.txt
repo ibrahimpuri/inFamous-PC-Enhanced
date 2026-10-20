@@ -167,9 +167,49 @@ option(PORT_PPU_REGCACHE "Compile register-cached copies of the lifted PPU TUs (
 # instructions but the extra live local raised stack traffic (+15-20% stack references), so it is an
 # A/B candidate, not a clear win. Flipping it recompiles all five TUs.
 option(PORT_PPU_VMB_LOCAL "Per-function local guest base in the register-cached PPU TUs (v156)" OFF)
+# v241B PORT_PPU_VR (default OFF; only with PORT_PPU_REGCACHE): VMX register caching + vector intrinsics for the
+# lifter's VMX templates (ps3recomp/tools/ppu_regcache_v241.py = ppu_regcache.py + --vr / --vr-ab; its output without
+# those flags is byte-identical to ppu_regcache.py). OFF = the v103 script exactly as before (no TU changes).
+#   ALL = every lifted function gets the new code (--vr: VR cache + VMX intrinsics + one-test scalar FP helpers;
+#         --nodrain: no trampoline drain after direct calls to functions that never set g_trampoline_fn).
+#   AB  = in-run A/B twins: the functions listed in PORT_PPU_VR_LIST get an old (v103) and a new (--vr) copy behind a
+#         dispatcher (env PPU_VR=0 old / PPU_VR_PHASE=0|1 new only in that PS3_AB parity / default new); everything
+#         else is the v103 code. Any change of this option recompiles all five lifted TUs.
+set(PORT_PPU_VR "OFF" CACHE STRING "Lifted PPU VMX register caching (v241B): OFF, ALL or AB")
+# v241: --nodrain is opt-in (PORT_PPU_VR_NODRAIN=ON). The 17:50 differential harness rerun showed 0 diffs
+# for --vr alone (1041 fns x 20 seeds) but 1 unexplained diff with --nodrain (func_002B9E80 seed 16, budget-cut run).
+option(PORT_PPU_VR_NODRAIN "v241B --nodrain trampoline-drain elision (unverified)" OFF)
+set(PORT_PPU_VR_LIST "${CMAKE_CURRENT_SOURCE_DIR}/tools/v241B_vr_hot.txt" CACHE FILEPATH "Function list for PORT_PPU_VR=AB (v241B)")
 if(PORT_PPU_REGCACHE)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(_rc_flags --stats)
+    set(_rc_script "${PS3RECOMP_DIR}/tools/ppu_regcache.py")
+    set(_rc_deps "")
+    # --nodrain scans ALL five lifted TUs (which functions set g_trampoline_fn), so every copy depends on all of them
+    set(_rc_all_ppu "")
+    foreach(_s IN LISTS RECOMP_SOURCES)
+        get_filename_component(_n "${_s}" NAME)
+        if(_n MATCHES "^ppu_recomp_[0-9]+\\.(c|cpp)$")
+            list(APPEND _rc_all_ppu "${_s}")
+        endif()
+    endforeach()
+    if(PORT_PPU_VR STREQUAL "ALL")
+        set(_rc_script "${PS3RECOMP_DIR}/tools/ppu_regcache_v241.py")
+        list(APPEND _rc_flags --vr)
+        if(PORT_PPU_VR_NODRAIN)
+            list(APPEND _rc_flags --nodrain)
+        endif()
+        set(_rc_deps ${_rc_all_ppu})
+        message(STATUS "Lifted PPU:      VMX register caching in every function (PORT_PPU_VR=ALL, v241B)")
+    elseif(PORT_PPU_VR STREQUAL "AB")
+        set(_rc_script "${PS3RECOMP_DIR}/tools/ppu_regcache_v241.py")
+        list(APPEND _rc_flags "--vr-ab=${PORT_PPU_VR_LIST}")
+        if(PORT_PPU_VR_NODRAIN)
+            list(APPEND _rc_flags --nodrain)
+        endif()
+        set(_rc_deps "${PORT_PPU_VR_LIST}" ${_rc_all_ppu})
+        message(STATUS "Lifted PPU:      VMX register caching A/B twins for ${PORT_PPU_VR_LIST} (PORT_PPU_VR=AB, v241B)")
+    endif()
     if(PORT_PPU_VMB_LOCAL)
         list(APPEND _rc_flags --vmb)
         message(STATUS "Lifted PPU:      per-function local guest base (PORT_PPU_VMB_LOCAL=ON, v156)")
@@ -183,8 +223,8 @@ if(PORT_PPU_REGCACHE)
             set(_out "${_rc_dir}/${_name}")
             add_custom_command(
                 OUTPUT "${_out}"
-                COMMAND "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/ppu_regcache.py" "${_src}" "${_out}" ${_rc_flags}
-                DEPENDS "${_src}" "${PS3RECOMP_DIR}/tools/ppu_regcache.py"
+                COMMAND "${Python3_EXECUTABLE}" "${_rc_script}" "${_src}" "${_out}" ${_rc_flags}
+                DEPENDS "${_src}" "${_rc_script}" ${_rc_deps}
                 COMMENT "PPU register caching (v103): ${_name}")
             list(APPEND _rc_sources "${_out}")
         else()
@@ -224,6 +264,41 @@ set(PS3RECOMP_SCAFFOLD
 set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu" CACHE PATH
     "Directory holding the lifted SPU images (<SPU_DIR>/<image>/spu_recomp.c)")
 option(PORT_ENABLE_SPU "Compile and register the title's lifted SPU images" ON)
+# v242B PORT_CPU_COMPAT (default OFF): the compatibility exe for CPUs without AVX2/FMA/BMI2 (pre-Haswell Intel,
+# AVX-less Pentium/Celeron, AMD before Excavator): forces PORT_SPU_AVX2=OFF and PORT_PPU_AVX2=OFF (floor = SSE4.1,
+# like the runtime's own -msse4.1), builds inFamousRecomp_sse4.exe and defines PORT_CPU_COMPAT (main.cpp entry check
+# asks for SSE4.1 only). The AVX2-only intrinsic paths have SSE4.1 twins under #if __AVX2__ (rsx_d3d12_backend.c,
+# cellGcmSys.c, spu_xfk.h); fused multiply-adds use fma()/fmaf(), never a*b+c, so the results are bit-identical.
+# Build: build_pgo.cmd USE build-sse4 <profile> -DPORT_CPU_COMPAT=ON
+# v242 PORT_CPU_AUTO (default ON): Setup and the updater build the game on the PC that runs it, so the first configure
+# of a build folder probes this CPU (tools/v242/cpu_probe.c, same test as the exe's startup check). Without
+# AVX2/FMA/BMI2 it selects PORT_CPU_COMPAT=ON by itself and keeps the normal exe name inFamousRecomp.exe, so the
+# installer and the launcher need no change. On AVX2 CPUs, for cross builds, or with an explicit -DPORT_CPU_COMPAT=...
+# nothing changes. PORT_CPU_AUTO_SIMULATE=ON (test only) acts as if the CPU lacked AVX2.
+option(PORT_CPU_AUTO "Select the compatibility build automatically on CPUs without AVX2/FMA/BMI2 (v242)" ON)
+option(PORT_CPU_AUTO_SIMULATE "Test only: configure as if this CPU lacked AVX2/FMA/BMI2 (v242)" OFF)
+if(PORT_CPU_AUTO AND WIN32 AND NOT CMAKE_CROSSCOMPILING AND NOT DEFINED CACHE{PORT_CPU_COMPAT})
+    try_run(_v242_cpu_run _v242_cpu_built "${CMAKE_BINARY_DIR}/v242_cpu_probe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/v242/cpu_probe.c")
+    if(_v242_cpu_built AND PORT_CPU_AUTO_SIMULATE)
+        set(_v242_cpu_run 1)
+    endif()
+    if(_v242_cpu_built AND "${_v242_cpu_run}" STREQUAL "1")
+        set(PORT_CPU_COMPAT ON CACHE BOOL "Compatibility build without AVX2/FMA/BMI2 (v242B; auto-selected by PORT_CPU_AUTO)")
+        set(PORT_CPU_COMPAT_AUTO ON CACHE INTERNAL "PORT_CPU_COMPAT was selected by the v242 CPU probe")
+        message(STATUS "CPU compat:      v242 this CPU has no AVX2/FMA/BMI2 -> compatibility build (PORT_CPU_AUTO)")
+    elseif(_v242_cpu_built AND "${_v242_cpu_run}" STREQUAL "2")
+        message(STATUS "CPU compat:      v242 CPU probe: AVX2/FMA/BMI2 present -> default build")
+    else()
+        message(STATUS "CPU compat:      v242 CPU probe gave no answer (built=${_v242_cpu_built} run=${_v242_cpu_run}) -> default build")
+    endif()
+endif()
+option(PORT_CPU_COMPAT "Compatibility build without AVX2/FMA/BMI2 (inFamousRecomp_sse4.exe, v242B)" OFF)
+if(PORT_CPU_COMPAT)
+    set(PORT_SPU_AVX2 OFF)
+    set(PORT_PPU_AVX2 OFF)
+    message(STATUS "CPU compat:      v242B PORT_CPU_COMPAT=ON -> no AVX2/FMA/BMI2 anywhere, exe inFamousRecomp_sse4")
+endif()
 option(PORT_SPU_AVX2 "Compile lifted SPU code with AVX2/FMA/BMI2 (Haswell+)" ON)
 # v30 (FPS): the runtime (SPU dispatcher/channels/MFC, RSX vertex conversion, cellSpurs)
 # gets the same AVX2/FMA/BMI2 codegen as the lifted SPU code when PORT_SPU_AVX2 is on.
@@ -411,8 +486,83 @@ if(WIN32)
 endif()
 # 2026-10-04: link map (build-fast\inFamousRecomp.map) so PS3_SAMPLE's host
 # `[samp] rva 0x...` buckets can be resolved to runtime/backend functions.
+# v242B: the compat build is inFamousRecomp_sse4.exe (+ .map of the same stem, bench_drive copies <exe>.map).
+set(_v242b_exe "inFamousRecomp")
+if(PORT_CPU_COMPAT)
+    if(NOT PORT_CPU_COMPAT_AUTO)   # v242: an auto-selected compat build keeps the normal exe name
+        set(_v242b_exe "inFamousRecomp_sse4")
+        set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${_v242b_exe}")
+    endif()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PORT_CPU_COMPAT=1)
+    # Two SPU-header spots differ between FMA and no-FMA codegen (kept unchanged for the default build): spu_xfk.h's
+    # spu_*_k macros use _mm_fmadd_ps unconditionally, and spu_helpers.h spu_fi's `base - step * y` is FUSED in the
+    # AVX2 build (lifted SPU TUs compile with clang's default -ffp-contract=on + -mfma). Configure-time copies with the
+    # equivalent explicit fmaf() forms go into an include dir searched FIRST, for the compat build only (lifted SPU TUs
+    # reach them as "spu_xfk.h" / "../../runtime/spu/spu_helpers.h"). Already-patched sources are copied unchanged.
+    set(_v242b_g "${CMAKE_BINARY_DIR}/v242b_compat_inc")
+    get_filename_component(_v242b_spu "${PS3RECOMP_DIR}/runtime/spu" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    file(READ "${_v242b_spu}/spu_helpers.h" _v242b_h)
+    string(REPLACE "\r\n" "\n" _v242b_h "${_v242b_h}")   # v242: CRLF copies (Setup/updater) match too
+    set(_v242b_old "        r._f32[i] = base - step * y;")
+    string(FIND "${_v242b_h}" "${_v242b_old}" _v242b_at)
+    if(_v242b_at GREATER -1)
+        string(REPLACE "${_v242b_old}" "        r._f32[i] = fmaf(-step, y, base);   /* v242B compat copy: = the fused AVX2 result */" _v242b_h "${_v242b_h}")
+    elseif(NOT _v242b_h MATCHES "fmaf\\(-step, y, base\\)")
+        message(FATAL_ERROR "PORT_CPU_COMPAT: spu_helpers.h spu_fi changed -- re-check its FP contraction (v242B)")
+    endif()
+    # spu_dfma family (unused by the current lifts, IR-checked): `x*y+t` etc. are contracted in the AVX2 build too
+    string(REPLACE "spu__dget(a,i)*spu__dget(b,i)+spu__dget(t,i)" "fma(spu__dget(a,i),spu__dget(b,i),spu__dget(t,i))" _v242b_h "${_v242b_h}")
+    string(REPLACE "spu__dget(a,i)*spu__dget(b,i)-spu__dget(t,i)" "fma(spu__dget(a,i),spu__dget(b,i),-spu__dget(t,i))" _v242b_h "${_v242b_h}")
+    string(REPLACE "spu__dget(t,i)-spu__dget(a,i)*spu__dget(b,i)" "fma(-spu__dget(a,i),spu__dget(b,i),spu__dget(t,i))" _v242b_h "${_v242b_h}")
+    file(WRITE "${_v242b_g}/runtime/spu/spu_helpers.h" "${_v242b_h}")
+    file(READ "${_v242b_spu}/spu_xfk.h" _v242b_x)
+    string(REPLACE "\r\n" "\n" _v242b_x "${_v242b_x}")   # v242: CRLF copies (Setup/updater) match too
+    if(NOT _v242b_x MATCHES "__FMA__")
+        string(FIND "${_v242b_x}" "#define spu_fma_k(a, b, c, m)" _v242b_at)
+        if(_v242b_at LESS 0)
+            message(FATAL_ERROR "PORT_CPU_COMPAT: spu_xfk.h layout changed (v242B)")
+        endif()
+        string(REPLACE "#define spu_fma_k(a, b, c, m)  spu__fst(_mm_fmadd_ps " "#define spu_fma_k(a, b, c, m)  spu__fst(spu__xfk_fmadd " _v242b_x "${_v242b_x}")
+        string(REPLACE "#define spu_fms_k(a, b, c, m)  spu__fst(_mm_fmsub_ps " "#define spu_fms_k(a, b, c, m)  spu__fst(spu__xfk_fmsub " _v242b_x "${_v242b_x}")
+        string(REPLACE "#define spu_fnms_k(a, b, c, m) spu__fst(_mm_fnmadd_ps(" "#define spu_fnms_k(a, b, c, m) spu__fst(spu__xfk_fnmadd(" _v242b_x "${_v242b_x}")
+        string(REPLACE "#ifndef SPU_XFK_H\n#define SPU_XFK_H\n" "#ifndef SPU_XFK_H\n#define SPU_XFK_H\n/* v242B compat copy: per-lane fused fmaf instead of the FMA intrinsics (fms = fma(a,b,-c), fnms = fma(-a,b,c)) */\nstatic inline __m128 spu__xfk_f3(__m128 a, __m128 b, __m128 c, int k) { float A[4], B[4], C[4], R[4]; _mm_storeu_ps(A, a); _mm_storeu_ps(B, b); _mm_storeu_ps(C, c); for (int i = 0; i < 4; i++) R[i] = k == 0 ? fmaf(A[i], B[i], C[i]) : k == 1 ? fmaf(A[i], B[i], -C[i]) : fmaf(-A[i], B[i], C[i]); return _mm_loadu_ps(R); }\n#define spu__xfk_fmadd(a, b, c)  spu__xfk_f3((a), (b), (c), 0)\n#define spu__xfk_fmsub(a, b, c)  spu__xfk_f3((a), (b), (c), 1)\n#define spu__xfk_fnmadd(a, b, c) spu__xfk_f3((a), (b), (c), 2)\n" _v242b_x "${_v242b_x}")
+        if(_v242b_x MATCHES "_mm_fn?m(add|sub)_ps")
+            message(FATAL_ERROR "PORT_CPU_COMPAT: spu_xfk.h still has FMA intrinsics after the v242B patch")
+        endif()
+    endif()
+    file(WRITE "${_v242b_g}/spu_xfk.h" "${_v242b_x}")
+    # "../../runtime/spu/spu_helpers.h" is looked up under every -I dir: <g>/a/b/../../runtime/spu = <g>/runtime/spu.
+    # Source-level include dirs come BEFORE the target's (checked with CMake 3.28/Ninja), so the SPU sources' own
+    # INCLUDE_DIRECTORIES property (set above to runtime/spu) gets the copies prepended.
+    file(MAKE_DIRECTORY "${_v242b_g}/a/b")
+    if(SPU_SOURCES)
+        set_source_files_properties(${SPU_SOURCES} PROPERTIES
+            INCLUDE_DIRECTORIES "${_v242b_g};${_v242b_g}/a/b;${PS3RECOMP_DIR}/runtime/spu")
+    endif()
+    message(STATUS "CPU compat:      v242B SPU header copies for no-FMA codegen in ${_v242b_g}")
+    # fma()/fmaf() -> the verified software versions in every TU (runtime + lifted PPU/SPU + game sources)
+    get_filename_component(_v242b_fi "${PS3RECOMP_DIR}/runtime/ppu/v242b_compat_fma.h" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(MSVC)
+        target_compile_options(${PROJECT_NAME} PRIVATE "/FI${_v242b_fi}")
+        if(TARGET ps3recomp_runtime)
+            target_compile_options(ps3recomp_runtime PRIVATE "/FI${_v242b_fi}")
+        endif()
+    else()
+        target_compile_options(${PROJECT_NAME} PRIVATE -include "${_v242b_fi}")
+        if(TARGET ps3recomp_runtime)
+            target_compile_options(ps3recomp_runtime PRIVATE -include "${_v242b_fi}")
+        endif()
+    endif()
+endif()
 if(WIN32)
-    target_link_options(${PROJECT_NAME} PRIVATE "/MAP:${CMAKE_BINARY_DIR}/inFamousRecomp.map")
+    target_link_options(${PROJECT_NAME} PRIVATE "/MAP:${CMAKE_BINARY_DIR}/${_v242b_exe}.map")
+endif()
+# v242B PORT_CPU_CHECK (default ON): entry point v242b_entry (main.cpp) checks the CPU features BEFORE the C runtime
+# and static constructors run (AVX2 code there would crash an older CPU first) and starts inFamousRecomp_sse4.exe or
+# shows a message; then it calls the normal mainCRTStartup. OFF = the default CRT entry as before.
+option(PORT_CPU_CHECK "Startup CPU feature check / compat relaunch (v242B)" ON)
+if(WIN32 AND MSVC AND PORT_CPU_CHECK)
+    target_link_options(${PROJECT_NAME} PRIVATE "/ENTRY:v242b_entry")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -465,6 +615,11 @@ if(MSVC)
     if(PORT_PPU_AVX2 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         list(APPEND _ppu_recomp_opts -mavx2 -mfma -mbmi -mbmi2 -mlzcnt -mmovbe -mpopcnt "/clang:-ffp-contract=off")
         message(STATUS "Lifted PPU:      AVX2/FMA/BMI2/LZCNT/MOVBE codegen (PORT_PPU_AVX2=ON, v102)")
+    endif()
+    # v241: the PORT_PPU_VR helpers need SSE4.1 (pshufb/blendv/ptest); the compat floor is SSE4.1 anyway.
+    if(NOT PORT_PPU_AVX2 AND NOT PORT_PPU_VR STREQUAL "OFF" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND _ppu_recomp_opts -msse4.1)
+        message(STATUS "Lifted PPU:      -msse4.1 for PORT_PPU_VR without AVX2 (v241)")
     endif()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "${_ppu_recomp_opts}")

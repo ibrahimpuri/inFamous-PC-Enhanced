@@ -87,6 +87,7 @@ It adds:
 
 - **Your own inFamous disc dump**, European release (`BCES00220`): an `.iso` (with its `.dkey` if it's encrypted) or the game folder that contains `PS3_GAME`.
 - **Windows 10 or 11**, 64-bit, and a Direct3D 12 GPU. DLSS needs an NVIDIA RTX card; DLSS 5 needs an RTX 50 series card. AMD FSR and FSR frame generation work on any card (FSR 4 on Radeon RX 7000 / 9000).
+- **A CPU with SSE4.1** (2008 or newer). On CPUs without AVX2 (Intel before 2013, Pentium / Celeron without AVX, AMD before 2015), Setup builds a slower compatibility version automatically. On PCs with 16 or fewer CPU threads the game uses fewer threads and less CPU (tested down to 4 threads).
 - [**Python 3.10+**](https://www.python.org/downloads/), with "Add python.exe to PATH" ticked.
 - [**Visual Studio 2022 Build Tools**](https://visualstudio.microsoft.com/downloads/) with *Desktop development with C++* and the *C++ Clang Compiler for Windows* component.
 - [**RPCS3**](https://rpcs3.net), only if your dump has `EBOOT.BIN` but no decrypted `EBOOT.elf`. It's used only to decrypt the executable.

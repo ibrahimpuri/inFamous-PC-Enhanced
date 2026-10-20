@@ -597,6 +597,272 @@ extern "C" int ps3_stdout_immediate(void)
 {
     return s_stdout_immediate;
 }
+/* v241C LOG_ASYNC (default 0 = off = exactly the old direct writes).
+ * stdout and stderr are redirected to files by the launchers, and both are unbuffered (_IONBF), so every printf /
+ * fprintf of a game thread was a synchronous WriteFile into the log file ON THAT THREAD: b910 main thread 0.5-2 % of
+ * its samples inside NtWriteFile from printf (bursts of cellSpurs workload lines, [HITCH] frames with 78 of 176
+ * samples in it), the SPURS audio kernel thread (w3) 1.95 % in fprintf(stderr).
+ * LOG_ASYNC=1: fd 1 and fd 2 write into anonymous pipes (4 MiB each); a HELPER PROCESS (this exe started with
+ * --v241c-logdrain, which runs nothing but the drain loops below) copies the bytes to the original file handles.
+ *  - Bytes identical: the CRT still does its text-mode translation on fd 1/2 (the pipe fds are _O_TEXT); the helper
+ *    copies raw bytes in order, one thread per stream.
+ *  - Nothing is lost on a crash, a fatal exit or the bench runner's kill: data a writer has handed to the pipe sits in
+ *    the kernel pipe buffer, which the helper (another process) keeps reading until EOF, i.e. until every write end
+ *    is closed = the game process is gone. The helper then appends one [LOG_ASYNC] stats line to the err log.
+ *  - A full pipe blocks the writer (identical bytes, like the old slow file write); the helper counts the reads that
+ *    found the pipe >= 75 % full ("near-full") so a stall is visible in that stats line.
+ *  - The helper runs on the efficiency cores when the CPU is hybrid (CPU sets, only those inside the process affinity
+ *    mask; none there = no restriction), off the main/FIFO/render cores. No hard-coded core.
+ *  - Any setup failure -> old direct path (logged).
+ * LOG_ASYNC_PHASE=0|1: pipes only in PS3_AB phases of that parity (fd 1/2 are re-pointed with _dup2 within ~50 ms of
+ * the phase switch; a few lines written right at a switch may land out of order between the two paths). */
+#ifdef _WIN32
+#include <fcntl.h>
+extern "C" volatile int g_ab_phase;
+namespace v241c_la {
+struct Stream { HANDLE rd, out; unsigned long long bytes, reads, nearfull, maxfill; };
+static const DWORD PIPE_SZ = 4u << 20;
+static DWORD WINAPI drain(LPVOID p)
+{
+    Stream* s = (Stream*)p;
+    char* buf = (char*)malloc(1 << 18);
+    if (!buf) return 0;
+    for (;;) {
+        DWORD n = 0;
+        if (!ReadFile(s->rd, buf, 1u << 18, &n, NULL) || n == 0) break;   /* EOF / broken pipe = writers gone */
+        DWORD avail = 0;
+        if (PeekNamedPipe(s->rd, NULL, 0, NULL, &avail, NULL)) {
+            const unsigned long long fill = (unsigned long long)n + avail;
+            if (fill > s->maxfill) s->maxfill = fill;
+            if (fill >= (PIPE_SZ / 4) * 3) s->nearfull++;
+        }
+        s->reads++; s->bytes += n;
+        const char* q = buf;
+        while (n) { DWORD w = 0; if (!WriteFile(s->out, q, n, &w, NULL) || !w) { n = 0; break; } q += w; n -= w; }
+    }
+    free(buf);
+    return 0;
+}
+static void place_on_efficiency_cores(void)
+{
+    typedef BOOL (WINAPI *GSCSI)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    typedef BOOL (WINAPI *SPDCS)(HANDLE, const ULONG*, ULONG);
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+    GSCSI gi = k ? (GSCSI)GetProcAddress(k, "GetSystemCpuSetInformation") : NULL;
+    SPDCS sp = k ? (SPDCS)GetProcAddress(k, "SetProcessDefaultCpuSets") : NULL;
+    if (!gi || !sp) return;
+    ULONG len = 0; gi(NULL, 0, &len, GetCurrentProcess(), 0);
+    if (!len || len > (1u << 20)) return;
+    unsigned char* b = (unsigned char*)malloc(len); if (!b) return;
+    if (gi((PSYSTEM_CPU_SET_INFORMATION)b, len, &len, GetCurrentProcess(), 0)) {
+        int lo = 256, hi = -1; ULONG ids[256]; ULONG n = 0;
+        for (ULONG o = 0; o < len; ) { PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(b + o);
+            if (c->Type == CpuSetInformation) { int e = c->CpuSet.EfficiencyClass; if (e < lo) lo = e; if (e > hi) hi = e; }
+            o += c->Size; if (!c->Size) break; }
+        /* only E-cores inside the process affinity mask (BENCH_AFFINITY / weak-PC runs): never widen it */
+        DWORD_PTR pm = 0, sm = 0; if (!GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) pm = 0;
+        if (hi > lo && pm)
+            for (ULONG o = 0; o < len && n < 256; ) { PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(b + o);
+                if (c->Type == CpuSetInformation && c->CpuSet.EfficiencyClass == lo && c->CpuSet.Group == 0 &&
+                    c->CpuSet.LogicalProcessorIndex < 8 * sizeof(DWORD_PTR) && ((pm >> c->CpuSet.LogicalProcessorIndex) & 1))
+                    ids[n++] = c->CpuSet.Id;
+                o += c->Size; if (!c->Size) break; }
+        if (n) sp(GetCurrentProcess(), ids, n);
+    }
+    free(b);
+}
+/* the helper process: argv = exe --v241c-logdrain <rd1> <file1> <rd2> <file2> (inherited handle values) */
+static int helper_main(int argc, char** argv)
+{
+    if (argc < 6) return 3;
+    place_on_efficiency_cores();
+    Stream s[2];
+    for (int i = 0; i < 2; i++) {
+        s[i].rd  = (HANDLE)(uintptr_t)_strtoui64(argv[2 + 2 * i], NULL, 16);
+        s[i].out = (HANDLE)(uintptr_t)_strtoui64(argv[3 + 2 * i], NULL, 16);
+        s[i].bytes = s[i].reads = s[i].nearfull = s[i].maxfill = 0;
+    }
+    HANDLE t = CreateThread(NULL, 0, drain, &s[0], 0, NULL);
+    drain(&s[1]);
+    if (t) WaitForSingleObject(t, INFINITE); else drain(&s[0]);
+    char ln[400];
+    const int m = snprintf(ln, sizeof ln,
+        "[LOG_ASYNC] v241C drain helper done: stdout %llu bytes / %llu reads, stderr %llu bytes / %llu reads; max pipe fill "
+        "%llu / %llu KiB of %lu; near-full (>=75 %%, writers may have blocked) %llu / %llu\r\n",
+        s[0].bytes, s[0].reads, s[1].bytes, s[1].reads, s[0].maxfill >> 10, s[1].maxfill >> 10,
+        (unsigned long)(PIPE_SZ >> 10), s[0].nearfull, s[1].nearfull);
+    DWORD w = 0; if (m > 0) WriteFile(s[1].out, ln, (DWORD)m, &w, NULL);
+    TerminateProcess(GetCurrentProcess(), 0);   /* skip the game's static destructors / PGO profile write */
+    return 0;
+}
+static int s_pfd[2] = { -1, -1 }, s_ofd[2] = { -1, -1 }, s_cur = 0, s_phase = -1;
+static void set_path(int on)
+{
+    if (on == s_cur) return;
+    for (int k = 0; k < 2; k++) _dup2(on ? s_pfd[k] : s_ofd[k], 1 + k);
+    s_cur = on;
+}
+static DWORD WINAPI phase_thread(LPVOID)
+{
+    for (;;) { set_path((g_ab_phase & 1) == s_phase); Sleep(50); }
+    return 0;
+}
+static void start(void)
+{
+    const char* e = getenv("LOG_ASYNC");
+    if (!(e && *e == '1')) return;
+    { const char* p = getenv("LOG_ASYNC_PHASE"); if (p && (*p == '0' || *p == '1')) s_phase = *p - '0'; }
+    fflush(stdout); fflush(stderr);
+    HANDLE rd[2] = { NULL, NULL }, wr[2] = { NULL, NULL }, oh[2] = { NULL, NULL };
+    int ok = 1;
+    for (int k = 0; k < 2 && ok; k++) {
+        const HANDLE cur = (HANDLE)_get_osfhandle(1 + k);
+        if (cur == INVALID_HANDLE_VALUE || cur == NULL) { ok = 0; break; }
+        if (!DuplicateHandle(GetCurrentProcess(), cur, GetCurrentProcess(), &oh[k], 0, TRUE, DUPLICATE_SAME_ACCESS)) { ok = 0; break; }
+        SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, FALSE };
+        if (!CreatePipe(&rd[k], &wr[k], &sa, PIPE_SZ)) { ok = 0; break; }
+        if (!SetHandleInformation(rd[k], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) { ok = 0; break; }
+    }
+    PROCESS_INFORMATION pi = {};
+    if (ok) {
+        SIZE_T asz = 0; InitializeProcThreadAttributeList(NULL, 1, 0, &asz);
+        LPPROC_THREAD_ATTRIBUTE_LIST al = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(asz);
+        HANDLE inh[4] = { rd[0], oh[0], rd[1], oh[1] };
+        ok = al && InitializeProcThreadAttributeList(al, 1, 0, &asz) &&
+             UpdateProcThreadAttribute(al, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inh, sizeof inh, NULL, NULL);
+        wchar_t exe[MAX_PATH]; char cmd[600];
+        if (ok && GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+            snprintf(cmd, sizeof cmd, "inFamousRecomp --v241c-logdrain %llx %llx %llx %llx",
+                     (unsigned long long)(uintptr_t)rd[0], (unsigned long long)(uintptr_t)oh[0],
+                     (unsigned long long)(uintptr_t)rd[1], (unsigned long long)(uintptr_t)oh[1]);
+            wchar_t wcmd[600]; MultiByteToWideChar(CP_ACP, 0, cmd, -1, wcmd, 600);
+            STARTUPINFOEXW si = {}; si.StartupInfo.cb = sizeof si; si.lpAttributeList = al;
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;   /* helper's own std handles: none */
+            ok = CreateProcessW(exe, wcmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                                NULL, NULL, &si.StartupInfo, &pi) ? 1 : 0;
+        } else ok = 0;
+        if (al) { DeleteProcThreadAttributeList(al); free(al); }
+    }
+    for (int k = 0; k < 2; k++) {   /* the parent keeps only the write ends */
+        if (rd[k]) CloseHandle(rd[k]);
+        if (oh[k]) CloseHandle(oh[k]);
+    }
+    if (ok) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        for (int k = 0; k < 2 && ok; k++) {
+            s_ofd[k] = _dup(1 + k);
+            s_pfd[k] = _open_osfhandle((intptr_t)wr[k], _O_TEXT);
+            if (s_ofd[k] < 0 || s_pfd[k] < 0) ok = 0;
+        }
+    }
+    if (!ok) {
+        for (int k = 0; k < 2; k++) { if (s_pfd[k] >= 0) _close(s_pfd[k]); else if (wr[k]) CloseHandle(wr[k]);
+                                      if (s_ofd[k] >= 0) _close(s_ofd[k]); s_pfd[k] = s_ofd[k] = -1; }
+        fprintf(stderr, "[LOG_ASYNC] v241C setup failed (err %lu) -> direct writes as before\n", GetLastError());
+        return;
+    }
+    fprintf(stderr, "[LOG_ASYNC] v241C ON: stdout/stderr through 4 MiB pipes drained by helper pid %lu%s\n",
+            (unsigned long)pi.dwProcessId, s_phase >= 0 ? (s_phase ? " (odd PS3_AB phases only)" : " (even PS3_AB phases only)") : "");
+    fflush(stderr);
+    if (s_phase < 0) set_path(1);
+    else CreateThread(NULL, 0, phase_thread, NULL, 0, NULL);
+}
+} /* namespace v241c_la */
+#endif
+#ifdef _WIN32
+/* ---------------------------------------------------------------------------
+ * v242B CPU feature check (runs as the process ENTRY POINT, before the C runtime and every static constructor --
+ * the runtime and the lifted code are built with AVX2/FMA/BMI2 and would die with an illegal instruction on an
+ * older or AVX-less CPU before main() could say anything).
+ *   AVX2 exe (default build): needs AVX + AVX2 + FMA + BMI1 + BMI2 + LZCNT + MOVBE + POPCNT and OS support for the
+ *     AVX state (XCR0). Missing -> start inFamousRecomp_sse4.exe from the same folder (PORT_CPU_COMPAT build, same
+ *     command line and std handles, killed with us via a job object) and return its exit code; no such file ->
+ *     message box + stderr line, exit 3.
+ *   compat exe (PORT_CPU_COMPAT=ON): needs SSE4.1 + SSSE3 (the floor of the runtime/SPU code); missing -> message.
+ *   PS3_CPU_CHECK=0 skips the check, PS3_CPU_CHECK=2 makes the AVX2 exe act as if AVX2 were missing (tests the relaunch).
+ * Only kernel32/user32 calls here: the CRT is not initialised yet.
+ * -----------------------------------------------------------------------*/
+#include <intrin.h>
+extern "C" unsigned long mainCRTStartup(void*);
+static int v242b_cpu_level(void)   /* 2 = AVX2 build OK, 1 = SSE4.1 build OK, 0 = neither */
+{
+    int r[4];
+    __cpuid(r, 0); const int maxl = r[0];
+    __cpuid(r, 1); const unsigned c1 = (unsigned)r[2];
+    const int sse41 = (c1 >> 19) & 1, ssse3 = (c1 >> 9) & 1, sse2 = 1;
+    const int fma = (c1 >> 12) & 1, movbe = (c1 >> 22) & 1, popcnt = (c1 >> 23) & 1, osx = (c1 >> 27) & 1, avx = (c1 >> 28) & 1;
+    int avx2 = 0, bmi1 = 0, bmi2 = 0, lzcnt = 0, osavx = 0;
+    if (maxl >= 7) { __cpuidex(r, 7, 0); avx2 = (r[1] >> 5) & 1; bmi1 = (r[1] >> 3) & 1; bmi2 = (r[1] >> 8) & 1; }
+    __cpuid(r, (int)0x80000000); if ((unsigned)r[0] >= 0x80000001u) { __cpuid(r, (int)0x80000001); lzcnt = (r[2] >> 5) & 1; }
+    if (osx) { unsigned lo, hi; __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0)); osavx = (lo & 6u) == 6u; (void)hi; }
+    if (sse2 && ssse3 && sse41 && avx && osavx && avx2 && fma && bmi1 && bmi2 && lzcnt && movbe && popcnt) return 2;
+    if (sse2 && ssse3 && sse41) return 1;
+    return 0;
+}
+static void v242b_err(const char* t)
+{
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE); DWORD w;
+    if (h && h != INVALID_HANDLE_VALUE) WriteFile(h, t, (DWORD)lstrlenA(t), &w, NULL);
+}
+static __declspec(noinline) void v242b_cpu_fallback(int lvl, int need)
+{
+    if (need == 2 && lvl >= 1) {
+        WCHAR path[2048]; DWORD n = GetModuleFileNameW(NULL, path, 2000);
+        while (n && path[n - 1] != L'\\' && path[n - 1] != L'/') n--;
+        const WCHAR* nm = L"inFamousRecomp_sse4.exe";
+        for (int i = 0; nm[i] && n < 2040; i++) path[n++] = nm[i];
+        path[n] = 0;
+        if (n && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            v242b_err("[CPU] v242B: this CPU lacks AVX2/FMA/BMI2 -> starting the compatibility build inFamousRecomp_sse4.exe\n");
+            STARTUPINFOW si; ZeroMemory(&si, sizeof si); si.cb = sizeof si;
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+            HANDLE hs[3] = { si.hStdInput, si.hStdOutput, si.hStdError };
+            for (int i = 0; i < 3; i++) if (hs[i] && hs[i] != INVALID_HANDLE_VALUE) SetHandleInformation(hs[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof pi);
+            HANDLE job = CreateJobObjectW(NULL, NULL);
+            if (job) { JOBOBJECT_EXTENDED_LIMIT_INFORMATION li; ZeroMemory(&li, sizeof li);
+                       li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                       SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li); }
+            if (CreateProcessW(path, GetCommandLineW(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+                if (job) AssignProcessToJobObject(job, pi.hProcess);
+                ResumeThread(pi.hThread); CloseHandle(pi.hThread);
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+                ExitProcess(code);
+            }
+            v242b_err("[CPU] v242B: could not start inFamousRecomp_sse4.exe\n");
+        }
+    }
+    const char* m = (need == 2 && lvl >= 1)
+        ? "This processor has no AVX2/FMA/BMI2 (Intel before Haswell 2013, Pentium/Celeron without AVX, AMD before Excavator 2015).\n\n"
+          "The compatibility build inFamousRecomp_sse4.exe was not found next to inFamousRecomp.exe. Put it there and start the game again."
+        : "This processor lacks SSE4.1/SSSE3, which this game needs (Intel Core 2 Penryn 2008 or newer, AMD Bulldozer 2011 or newer).";
+    v242b_err("[CPU] v242B: unsupported CPU: "); v242b_err(m); v242b_err("\n");
+    MessageBoxA(NULL, m, "inFamous -- CPU not supported", MB_OK | MB_ICONERROR);
+    ExitProcess(3);
+}
+static __declspec(noinline) int v242b_check_env(void)   /* PS3_CPU_CHECK: 0 = skip, 2 = simulate missing AVX2 */
+{
+    WCHAR v[8]; const DWORD n = GetEnvironmentVariableW(L"PS3_CPU_CHECK", v, 8);
+    return (n && n < 8) ? (int)(v[0] - L'0') : 1;
+}
+#if defined(PORT_CPU_COMPAT)
+#define V242B_NEED 1
+#else
+#define V242B_NEED 2
+#endif
+extern "C" __declspec(safebuffers) unsigned long v242b_entry(void* peb)
+{
+    const int mode = v242b_check_env();
+    if (mode != 0) {
+        int lvl = v242b_cpu_level();
+        if (mode == 2 && V242B_NEED == 2 && lvl == 2) lvl = 1;
+        if (lvl < V242B_NEED) v242b_cpu_fallback(lvl, V242B_NEED);
+    }
+    return mainCRTStartup(peb);
+}
+#endif
 static void configure_stdout_buffering(void)
 {
     const char* force = getenv("PS3_STDOUT_UNBUFFERED");
@@ -615,10 +881,50 @@ static void configure_stdout_buffering(void)
 }
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    /* v241C LOG_ASYNC drain helper process (see v241c_la): nothing else runs in it */
+    if (argc >= 2 && strcmp(argv[1], "--v241c-logdrain") == 0) return v241c_la::helper_main(argc, argv);
+    /* v242B PS3_AFFINITY=<hex mask> (default unset = nothing): restrict the whole process to those logical CPUs
+     * BEFORE any thread exists (weak-PC emulation / user choice). bench_drive's BENCH_AFFINITY only applies the mask
+     * after the start, so threads sized at boot saw all CPUs. Bits outside the system mask are ignored. */
+    unsigned long long v242b_aff = 0;
+    { const char* a = getenv("PS3_AFFINITY");
+      if (a && *a) { DWORD_PTR pm = 0, sm = 0; unsigned long long m = strtoull(a, NULL, 16);
+        if (m && GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) { m &= (unsigned long long)sm;
+          if (m && SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)m)) v242b_aff = m; } } }
+#endif
     /* Must precede the first access to stdout (including the no-argument boot
      * messages below); changing buffering after I/O is undefined by stdio. */
     configure_stdout_buffering();
     load_settings_ini();
+    /* v242B LOW_CPU=1 (default OFF): opt-in preset for weak CPUs. These are QUALITY levers -- the game looks/animates
+     * differently from the default -- so the preset only exists for users who choose it:
+     *   ANIM_LOD=1        (v216) low-detail skeletons (job size <= ANIM_LOD_MAX) update their animation every other
+     *                     frame; the player (Cole) is never skipped. Less PPU (w16) + SPU (w2) work per frame.
+     *   ADAPT_LOD=1, ADAPT_LOD_MIN=0.7  (v237B) below 58 fps the adaptive draw distance may go down to 70 % of the
+     *                     original console distances (default floor 1.0 = console) -> fewer objects culled/drawn.
+     * The preset WINS over the launcher's values of these keys (play_pgo.cmd / ship_env set ANIM_LOD=0). */
+    { const char* lc = getenv("LOW_CPU");
+      if (lc && *lc == '1') {
+          static const char* kv[][2] = { { "ANIM_LOD", "1" }, { "ADAPT_LOD", "1" }, { "ADAPT_LOD_MIN", "0.7" } };
+          for (size_t i = 0; i < sizeof kv / sizeof kv[0]; i++) {
+              _putenv_s(kv[i][0], kv[i][1]);
+          }
+          fprintf(stderr, "[LOW_CPU] v242B low-end preset ON (quality levers): ANIM_LOD=%s ADAPT_LOD=%s ADAPT_LOD_MIN=%s\n",
+                  getenv("ANIM_LOD"), getenv("ADAPT_LOD"), getenv("ADAPT_LOD_MIN"));
+      } }
+#ifdef _WIN32
+    v241c_la::start();   /* v241C LOG_ASYNC=1 (default off; after settings.ini, which may set it) */
+    if (v242b_aff) fprintf(stderr, "[CPU] v242B PS3_AFFINITY: process limited to mask 0x%llX (%d logical CPUs)\n",
+                           v242b_aff, (int)__builtin_popcountll(v242b_aff));
+    fprintf(stderr, "[CPU] v242B %s build, CPU feature level %d (2 = AVX2/FMA/BMI2, 1 = SSE4.1 only)\n",
+#if defined(PORT_CPU_COMPAT)
+            "SSE4.1 compatibility (PORT_CPU_COMPAT)",
+#else
+            "AVX2",
+#endif
+            v242b_cpu_level());
+#endif
 #ifdef PORT_PGO_GEN
     CreateThread(NULL, 0, pgo_dump_thread, NULL, 0, NULL);
     fprintf(stderr, "[PGO] v189 instrumented build: profile written every 30 s + at exit (LLVM_PROFILE_FILE)\n");
